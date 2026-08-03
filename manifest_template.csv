@@ -1,0 +1,24 @@
+run_id,mouse_id,section_id,condition,run_dir
+# One row per Xenium run directory.
+#
+#   run_id     unique label for this run (free text)
+#   mouse_id   THE ANIMAL. Sections from the same mouse MUST share this value —
+#              it is the only field the audit cannot derive from disk, and it is
+#              what stops sections being treated as independent replicates.
+#   section_id label for the section within the mouse (e.g. s1, s2, rostral)
+#   condition  biological group (e.g. AGED / ADULT)
+#   run_dir    absolute path to the Xenium output bundle
+#
+# Panel, segmentation kit, software version and run date are NOT declared here —
+# they are read from each run directory, because declared metadata is exactly
+# what drifts. You may add optional override columns (panel_group,
+# segmentation_kit, ...); where an override disagrees with what is on disk the
+# audit reports the disagreement rather than trusting either silently.
+#
+# Delete these comment lines and the examples below, then fill in your runs.
+AGED_1_s1,M_A01,s1,AGED,/path/to/aged_mouse1_sectionA
+AGED_1_s2,M_A01,s2,AGED,/path/to/aged_mouse1_sectionB
+AGED_2_s1,M_A02,s1,AGED,/path/to/aged_mouse2_sectionA
+ADULT_1_s1,M_D01,s1,ADULT,/path/to/adult_mouse1_sectionA
+ADULT_1_s2,M_D01,s2,ADULT,/path/to/adult_mouse1_sectionB
+ADULT_2_s1,M_D02,s1,ADULT,/path/to/adult_mouse2_sectionA

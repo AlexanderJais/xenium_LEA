@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environments
+.env
+.venv
+venv/
+
+# Audit outputs
+audit_out/
+*_audit_out/
+report.html
+findings.json
+
+# Caches
+*_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Xenium run data must never be committed
+*.mtx.gz
+*.parquet
+*.h5ad
+*.h5
+*.ome.tif
+experiment.xenium
+
+# macOS / IDE
+.DS_Store
+.vscode/
+.idea/
