@@ -434,3 +434,47 @@ def test_a_genuinely_high_control_rate_is_still_flagged(tmp_path):
 
     flagged = {r for fnd in f.by_code("qc.outlier_run") for r in fnd.run_ids}
     assert "BAD" in flagged
+
+
+def test_no_morphology_split_when_every_run_is_the_same_method(tmp_path):
+    """
+    Regression from the real female stratum: three stain runs measuring 1.396,
+    1.416 and 1.468 were reported as splitting into two groups. They are all
+    well past the decision threshold and all the same method — with a handful of
+    runs, some gap always looks wide relative to a narrow range. A split is only
+    a split if it crosses the boundary.
+    """
+    probes = [
+        _probe(tmp_path, f"S{i}", n_cells=4000, segmentation=fx.STAIN, seed=40 + i)
+        for i in range(3)
+    ]
+
+    f = Findings()
+    table, _ = audit_segmentation(probes, f)
+
+    ratios = pd.to_numeric(table["expansion_tail_ratio"])
+    assert (ratios > 1.25).all()          # all the same side of the boundary
+    assert not f.has("segmentation.morphology_split")
+    assert f.has("segmentation.uniform")
+
+
+def test_no_morphology_split_when_every_run_is_the_same_method(tmp_path):
+    """
+    Regression from the real female stratum: three stain runs measuring 1.396,
+    1.416 and 1.468 were reported as splitting into two groups. They are all
+    well past the decision threshold and all the same method — with a handful of
+    runs, some gap always looks wide relative to a narrow range. A split is only
+    a split if it crosses the boundary.
+    """
+    probes = [
+        _probe(tmp_path, f"S{i}", n_cells=4000, segmentation=fx.STAIN, seed=40 + i)
+        for i in range(3)
+    ]
+
+    f = Findings()
+    table, _ = audit_segmentation(probes, f)
+
+    ratios = pd.to_numeric(table["expansion_tail_ratio"])
+    assert (ratios > 1.25).all()          # all the same side of the boundary
+    assert not f.has("segmentation.morphology_split")
+    assert f.has("segmentation.uniform")

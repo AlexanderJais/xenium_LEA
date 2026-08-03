@@ -448,6 +448,7 @@ def audit_design(
 
     # -- factor vs condition ---------------------------------------------
     unknown_dominated: dict[str, int] = {}
+    partial_coverage: dict[str, int] = {}
     considered = [
         c for c in list(factors) + list(covariates)
         if c in factor_table.columns
@@ -458,7 +459,8 @@ def audit_design(
     for col in considered:
         values = factor_table[col].astype(str)
         levels = sorted(values.unique())
-        n_unknown = int((values == UNKNOWN_LEVEL).sum())
+        known = values != UNKNOWN_LEVEL
+        n_unknown = int((~known).sum())
 
         if (
             n_unknown
@@ -468,6 +470,18 @@ def audit_design(
             # Unknown for most runs: the split reflects which files were
             # uploaded, not the experiment.
             verdict = UNKNOWN_DOMINATED
+        elif n_unknown and len(levels) > 1:
+            # A few runs are unknown. "unknown" is absence of information, not a
+            # level: contrasting it against a real value compares "we measured
+            # X" with "we did not look", which is never a design fact. Classify
+            # on the runs where the value is known, and say the coverage is
+            # partial. Without this, one run missing its experiment.xenium turns
+            # every field that file supplies into a spurious PARTIAL.
+            if condition[known].nunique() < 2:
+                verdict = UNKNOWN_DOMINATED
+            else:
+                verdict = classify_factor(values[known], condition[known])
+                partial_coverage[col] = n_unknown
         else:
             verdict = classify_factor(values, condition)
         v_stat = cramers_v(values, condition)
@@ -554,6 +568,21 @@ def audit_design(
                               str(k): int(v) for k, v in
                               values.value_counts().items()}},
             )
+
+    if partial_coverage:
+        f.info(
+            "design.factors_partial_coverage",
+            f"{len(partial_coverage)} factor(s) are unknown for a minority of "
+            f"runs and were classified on the rest: "
+            + ", ".join(
+                f"{k} ({v} run{'s' if v > 1 else ''} unknown)"
+                for k, v in sorted(partial_coverage.items())
+            )
+            + ". 'unknown' is missing information rather than a level, so "
+            "contrasting it against a real value would compare 'we measured X' "
+            "with 'we did not look'.",
+            evidence={"factors": partial_coverage, "n_runs": len(factor_table)},
+        )
 
     if unknown_dominated:
         # One fact, however many fields it touches: these all come from the same

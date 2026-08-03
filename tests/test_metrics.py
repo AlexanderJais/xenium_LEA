@@ -280,3 +280,113 @@ def test_covariate_nested_in_condition_does_not_downgrade_the_verdict(tmp_path):
     assert result.design.verdicts["age_weeks"].verdict in ("NESTED", "PER_RUN")
     assert result.design.overall == "OK"
     assert not result.findings.has("design.verdict_caution")
+
+
+def test_one_run_missing_metadata_does_not_make_every_field_partial(tmp_path):
+    """
+    Regression from the real female stratum.
+
+    Three of four runs had a full bundle and one had only metrics_summary.csv.
+    Every field experiment.xenium supplies then had two "levels" — the real
+    value and "unknown" — and each was reported as PARTIAL, dragging an
+    otherwise clean stratum to CAUTION. "unknown" is missing information, not a
+    level: contrasting it against a real value compares "we measured X" with
+    "we did not look".
+    """
+    table = pd.DataFrame(
+        [
+            {"run_id": "R1", "mouse_id": "M1", "section_id": "s1",
+             "condition": "aged", "instrument_sn": "XETG00163",
+             "chemistry_version": "v1"},
+            {"run_id": "R2", "mouse_id": "M2", "section_id": "s1",
+             "condition": "aged", "instrument_sn": "XETG00163",
+             "chemistry_version": "v1"},
+            {"run_id": "R3", "mouse_id": "M3", "section_id": "s1",
+             "condition": "adult", "instrument_sn": "XETG00163",
+             "chemistry_version": "v1"},
+            {"run_id": "R4", "mouse_id": "M4", "section_id": "s1",
+             "condition": "adult", "instrument_sn": "unknown",
+             "chemistry_version": "unknown"},
+        ]
+    )
+    f = Findings()
+    audit = audit_design(table, findings=f)
+
+    # Constant among the runs where it is known — not PARTIAL.
+    assert audit.verdicts["instrument_sn"].verdict == "CONSTANT"
+    assert audit.verdicts["chemistry_version"].verdict == "CONSTANT"
+    assert audit.overall == "OK"
+    # ...and the reduced coverage is stated rather than silently assumed away.
+    assert f.has("design.factors_partial_coverage")
+
+
+def test_a_factor_unknown_for_most_runs_is_still_excluded_entirely(tmp_path):
+    """The minority case is classified on the rest; the majority case is not."""
+    table = pd.DataFrame(
+        [
+            {"run_id": f"R{i}", "mouse_id": f"M{i}", "section_id": "s1",
+             "condition": "aged" if i < 3 else "adult",
+             "instrument_sn": "XETG00163" if i == 0 else "unknown"}
+            for i in range(6)
+        ]
+    )
+    f = Findings()
+    audit = audit_design(table, findings=f)
+
+    assert audit.verdicts["instrument_sn"].verdict == UNKNOWN_DOMINATED
+    assert f.has("design.factors_unknown_dominated")
+
+
+def test_one_run_missing_metadata_does_not_make_every_field_partial():
+    """
+    Regression from the female stratum mid-assembly.
+
+    Three of four runs had a full bundle and one had only metrics_summary.csv.
+    Every field experiment.xenium supplies then had two "levels" — the real
+    value and "unknown" — and each was reported as PARTIAL, dragging an
+    otherwise clean stratum to CAUTION. "unknown" is missing information, not a
+    level: contrasting it against a real value compares "we measured X" with
+    "we did not look".
+    """
+    table = pd.DataFrame(
+        [
+            {"run_id": "R1", "mouse_id": "M1", "section_id": "s1",
+             "condition": "aged", "instrument_sn": "XETG00163",
+             "chemistry_version": "v1"},
+            {"run_id": "R2", "mouse_id": "M2", "section_id": "s1",
+             "condition": "aged", "instrument_sn": "XETG00163",
+             "chemistry_version": "v1"},
+            {"run_id": "R3", "mouse_id": "M3", "section_id": "s1",
+             "condition": "adult", "instrument_sn": "XETG00163",
+             "chemistry_version": "v1"},
+            {"run_id": "R4", "mouse_id": "M4", "section_id": "s1",
+             "condition": "adult", "instrument_sn": "unknown",
+             "chemistry_version": "unknown"},
+        ]
+    )
+    f = Findings()
+    audit = audit_design(table, findings=f)
+
+    # Constant among the runs where it is known — not PARTIAL.
+    assert audit.verdicts["instrument_sn"].verdict == "CONSTANT"
+    assert audit.verdicts["chemistry_version"].verdict == "CONSTANT"
+    assert audit.overall == "OK"
+    # ...and the reduced coverage is stated rather than silently assumed away.
+    assert f.has("design.factors_partial_coverage")
+
+
+def test_a_factor_unknown_for_most_runs_is_still_excluded_entirely():
+    """The minority case is classified on the rest; the majority case is not."""
+    table = pd.DataFrame(
+        [
+            {"run_id": f"R{i}", "mouse_id": f"M{i}", "section_id": "s1",
+             "condition": "aged" if i < 3 else "adult",
+             "instrument_sn": "XETG00163" if i == 0 else "unknown"}
+            for i in range(6)
+        ]
+    )
+    f = Findings()
+    audit = audit_design(table, findings=f)
+
+    assert audit.verdicts["instrument_sn"].verdict == UNKNOWN_DOMINATED
+    assert f.has("design.factors_unknown_dominated")

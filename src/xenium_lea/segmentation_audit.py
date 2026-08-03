@@ -556,6 +556,15 @@ def _report_morphology_split(table: pd.DataFrame, f: Findings) -> None:
     if low.empty or high.empty:
         return
 
+    # Only report a split that crosses the decision boundary. Runs all on the
+    # same side of it are all the same segmentation method, and the "gap"
+    # between them is ordinary run-to-run variation — with a handful of runs,
+    # some gap always looks wide relative to a narrow range.
+    if not (
+        float(s.min()) < EXPANSION_TAIL_RATIO_MAX <= float(s.max())
+    ):
+        return
+
     f.warning(
         "segmentation.morphology_split",
         f"Runs split into two groups on the implied-expansion tail ratio "
