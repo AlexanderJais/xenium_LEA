@@ -25,7 +25,8 @@ from .design import (
     PARTIAL,
 )
 from .manifest import RunManifest
-from .report import write_report
+from .report import write_report, write_stratified_report
+from .stratify import run_stratified_audit
 
 _PANEL_FILENAME = "Xenium_mBrain_v1_1_metadata.csv"
 
@@ -98,6 +99,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Where to cache pseudobulk vectors (default: <out>/cache).",
     )
     a.add_argument(
+        "--split-by", metavar="COLUMN", default=None,
+        help=(
+            "Audit each level of this manifest column separately (e.g. "
+            "--split-by sex). Use when a covariate is confounded with a "
+            "technical factor: inside a level that factor is constant, so the "
+            "confound disappears and the whole panel becomes usable — at the "
+            "cost of animals per group, and of any comparison between levels. "
+            "The pooled audit is written alongside for comparison."
+        ),
+    )
+    a.add_argument(
         "--no-fail", action="store_true",
         help="Always exit 0, even when error-severity findings are present.",
     )
@@ -131,6 +143,23 @@ def main(argv: list[str] | None = None) -> int:
 
     cache_dir = args.cache_dir or (args.out / "cache")
 
+    if args.split_by:
+        strat = run_stratified_audit(
+            manifest,
+            base_panel_csv=base_panel,
+            split_by=args.split_by,
+            deep=args.deep,
+            min_counts_per_cell=args.min_counts_per_cell,
+            qc_thresholds=tuple(args.qc_thresholds),
+            cache_dir=cache_dir if args.deep else None,
+        )
+        written = write_stratified_report(strat, args.out)
+        _print_stratified_summary(strat, written, args.out)
+        has_errors = strat.findings.has_errors or any(
+            s.result.findings.has_errors for s in strat.audited
+        )
+        return 1 if (has_errors and not args.no_fail) else 0
+
     result = run_audit(
         manifest,
         base_panel_csv=base_panel,
@@ -146,6 +175,32 @@ def main(argv: list[str] | None = None) -> int:
     if result.findings.has_errors and not args.no_fail:
         return 1
     return 0
+
+
+def _print_stratified_summary(strat, written: dict[str, Path], out_dir: Path) -> None:
+    import sys as _sys
+
+    print("", file=_sys.stderr)
+    print("=" * 72, file=_sys.stderr)
+    print(f"STRATIFIED AUDIT — split by '{strat.split_by}'", file=_sys.stderr)
+    print("-" * 72, file=_sys.stderr)
+    for row in strat.comparison.to_dict("records"):
+        print(
+            f"  {str(row.get('stratum','')):22s} {str(row.get('verdict','')):12s}"
+            f" runs={row.get('n_runs','?'):<3} mice={row.get('n_mice','?'):<3}"
+            f" genes={row.get('n_safe_genes','?'):<5}"
+            f" [{row.get('mice_per_condition','')}]",
+            file=_sys.stderr,
+        )
+    print("-" * 72, file=_sys.stderr)
+    for f in strat.findings.by_severity("error"):
+        print(f"  ERROR  {f.code}: {f.message[:150]}", file=_sys.stderr)
+    for f in strat.findings.by_severity("warning"):
+        print(f"  WARN   {f.code}: {f.message[:150]}", file=_sys.stderr)
+    print("-" * 72, file=_sys.stderr)
+    print(f"Index:   {written.get('index.html', out_dir)}", file=_sys.stderr)
+    print(f"Outputs: {len(written)} file(s) in {out_dir}", file=_sys.stderr)
+    print("=" * 72, file=_sys.stderr)
 
 
 def _print_summary(result, written: dict[str, Path], out_dir: Path) -> None:

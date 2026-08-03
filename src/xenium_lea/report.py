@@ -757,3 +757,112 @@ def write_report(result: AuditResult, out_dir: Path | str) -> dict[str, Path]:
     written["report.html"] = html_path
 
     return written
+
+
+# ---------------------------------------------------------------------------
+# Stratified output
+# ---------------------------------------------------------------------------
+
+_STRATUM_VERDICT_COLOUR = {
+    OVERALL_BLOCKED: "#8B1A1A",
+    OVERALL_CAUTION: "#8a6100",
+    "OK": "#1b5e20",
+    "NO_CONTRAST": "#444",
+}
+
+
+def build_stratified_index(result, links: dict[str, str]) -> str:
+    """
+    Index page for a stratified audit.
+
+    Leads with the side-by-side comparison, because the point of splitting is
+    the trade it makes — confounds removed and genes gained, against animals per
+    group lost — and that is only visible with the pooled run next to the strata.
+    """
+    counts = result.findings.counts()
+    rows = []
+    for r in result.comparison.to_dict("records"):
+        label = str(r.get("stratum", ""))
+        verdict = str(r.get("verdict", ""))
+        colour = _STRATUM_VERDICT_COLOUR.get(verdict, "#444")
+        href = links.get(label)
+        name = (
+            f'<a href="{_esc(href)}">{_esc(label)}</a>' if href else _esc(label)
+        )
+        rows.append(
+            f"<tr><td><b>{name}</b></td>"
+            f'<td style="color:{colour};font-weight:600">{_esc(verdict)}</td>'
+            f"<td>{_esc(r.get('n_runs'))}</td>"
+            f"<td>{_esc(r.get('n_mice'))}</td>"
+            f"<td>{_esc(r.get('mice_per_condition'))}</td>"
+            f"<td>{_esc(r.get('n_safe_genes'))}</td>"
+            f"<td>{_esc(r.get('n_errors'))} / {_esc(r.get('n_warnings'))}</td>"
+            f"<td>{_esc(r.get('unresolved_factors')) or '&mdash;'}</td></tr>"
+        )
+
+    table = (
+        '<div class="scroll"><table><thead><tr>'
+        "<th>Analysis</th><th>Verdict</th><th>Runs</th><th>Mice</th>"
+        "<th>Mice per condition</th><th>Genes usable</th>"
+        "<th>Errors / warnings</th><th>Still confounded</th>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
+    )
+
+    body = (
+        f"<h2>Split by <code>{_esc(result.split_by)}</code></h2>"
+        '<div class="note">Each stratum is audited on its own, with the pooled '
+        "study alongside for comparison. Follow a link for that analysis&rsquo; "
+        "full report.</div>"
+        + table
+        + f"<h2>What the split means "
+        f'<span class="muted">({counts["error"]} error, {counts["warning"]} '
+        f'warning, {counts["info"]} info)</span></h2>'
+        + _findings_html(result.findings)
+    )
+    return (
+        "<title>Xenium audit &mdash; stratified</title>"
+        f"<style>{_CSS}</style>"
+        '<header><div class="wrap"><h1>Xenium dataset audit &mdash; stratified</h1>'
+        '<div class="sub">Read-only audit &mdash; no data is modified and no '
+        "batch correction is applied.</div></div></header>"
+        f'<div class="wrap">{body}</div>'
+    )
+
+
+def write_stratified_report(result, out_dir: Path | str) -> dict[str, Path]:
+    """Write the pooled report, one report per stratum, and an index."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    written: dict[str, Path] = {}
+    links: dict[str, str] = {}
+
+    def _slug(text: str) -> str:
+        return "".join(
+            c if c.isalnum() or c in "-_=" else "_" for c in str(text)
+        )
+
+    if result.pooled is not None:
+        sub = out / "pooled"
+        for name, path in write_report(result.pooled, sub).items():
+            written[f"pooled/{name}"] = path
+        links["POOLED"] = "pooled/report.html"
+
+    for stratum in result.strata:
+        if stratum.result is None:
+            continue
+        sub = out / _slug(stratum.key)
+        for name, path in write_report(stratum.result, sub).items():
+            written[f"{stratum.key}/{name}"] = path
+        links[stratum.key] = f"{_slug(stratum.key)}/report.html"
+
+    if not result.comparison.empty:
+        p = out / "stratification_summary.csv"
+        result.comparison.to_csv(p, index=False)
+        written["stratification_summary.csv"] = p
+
+    written["findings.json"] = result.findings.write_json(out / "findings.json")
+
+    index = out / "index.html"
+    index.write_text(build_stratified_index(result, links), encoding="utf-8")
+    written["index.html"] = index
+    return written

@@ -156,6 +156,35 @@ over that baseline is called a driver.
 
 ---
 
+## Splitting the analysis when a covariate is confounded
+
+If a covariate turns out to be perfectly aliased with a technical factor, the
+usual response is to analyse within its levels:
+
+```bash
+xenium-lea audit --manifest manifest.csv --split-by sex --out audit_out
+```
+
+That writes `audit_out/index.html` comparing every analysis side by side, plus a
+full report for each stratum and for the pooled study.
+
+It is worth being precise about the trade, because splitting is not simply the
+safe option:
+
+| | |
+|---|---|
+| **Gains** | Inside a stratum the aliased factors are **constant** — no panel difference, no segmentation difference, nothing to adjust for. The **whole panel** becomes usable, not just the genes shared across designs. |
+| **Costs** | Replicates. An n=4 vs n=4 comparison split in half is n=2 vs n=2, and no stratum borrows strength from the other. |
+| **Forecloses** | The strata can no longer be compared. Splitting on a confounded covariate **accepts losing** that comparison rather than recovering it. |
+| **Becomes** | Two independent replicates of the same question under entirely different technical conditions. An effect present in **both** is stronger evidence than one pooled result, because no shared technical artefact could produce it. |
+
+The exit status follows the strata, since those are the analyses that will be
+used. The pooled report is kept as the record of why the split was needed, and
+if it carries errors the run says so explicitly rather than letting exit 0 read
+as "nothing found".
+
+---
+
 ## Getting data to the audit
 
 Per run, the audit reads only three things — the panel, the cells, and the run

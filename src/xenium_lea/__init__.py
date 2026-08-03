@@ -50,6 +50,9 @@ __all__ = [
     "build_factor_table",
     "run_audit",
     "write_report",
+    "write_stratified_report",
+    "run_stratified_audit",
+    "split_manifest",
     "build_html",
     "AuditResult",
 ]
@@ -70,6 +73,9 @@ _LAZY = {
     "build_factor_table": "design",
     "run_audit": "audit",
     "write_report": "report",
+    "write_stratified_report": "report",
+    "run_stratified_audit": "stratify",
+    "split_manifest": "stratify",
     "build_html": "report",
     "AuditResult": "report",
 }
