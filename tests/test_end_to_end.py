@@ -252,3 +252,89 @@ def test_cli_reports_a_missing_manifest_cleanly(tmp_path):
         "--out", str(tmp_path / "out"),
     ])
     assert code == 2
+
+
+def test_partial_sections_state_their_coverage(tmp_path):
+    """
+    A table silently listing 1 of 14 runs reads as "the other 13 vanished".
+
+    Only runs with a full bundle can contribute gene-level panel contents, so
+    that section is legitimately partial — and it has to say so, naming what is
+    missing and why.
+    """
+    from . import fixtures as fx
+
+    root = tmp_path / "study"
+    # One full bundle...
+    base = fx.base_gene_names(15)
+    panel_csv = fx.write_base_panel_csv(root / "base_panel.csv", base)
+    full = root / "runs" / "FULL_1"
+    fx.make_run(full, genes=base + ["AddA"], n_cells=200, segmentation=fx.STAIN)
+    fx.write_metrics_summary(full / "metrics_summary.csv", region_name="FULL_1",
+                             run_name="run_nov", panel_design_id="NCY734",
+                             stain_frac=0.93)
+    rows = [{"run_id": "FULL_1", "mouse_id": "MF", "section_id": "1",
+             "condition": "aged", "run_dir": str(full)}]
+    # ...and three metrics-only runs.
+    for i, (rid, mouse, cond) in enumerate(
+        [("M1_1", "M1", "aged"), ("M2_1", "M2", "adult"), ("M3_1", "M3", "adult")]
+    ):
+        d = root / "runs" / rid
+        d.mkdir(parents=True, exist_ok=True)
+        fx.write_metrics_summary(d / "metrics_summary.csv", region_name=rid,
+                                 run_name="run_jun", panel_design_id="7ZBFXR",
+                                 stain_frac=0.0)
+        rows.append({"run_id": rid, "mouse_id": mouse, "section_id": "1",
+                     "condition": cond, "run_dir": str(d)})
+    manifest_path = fx.write_manifest(root / "manifest.csv", rows)
+
+    result = run_audit(RunManifest.from_csv(manifest_path), panel_csv)
+    out = tmp_path / "audit_out"
+    write_report(result, out)
+    html = (out / "report.html").read_text(encoding="utf-8")
+
+    # The panel section covers one run and says so, naming the other three.
+    assert "Covers 1 of 4 runs." in html
+    for rid in ("M1_1", "M2_1", "M3_1"):
+        assert rid in html
+    assert "metrics_summary.csv names the panel design but not its genes" in html
+
+    # Sections that do cover everything carry no coverage note...
+    assert len(result.cell_qc.per_run) == 4
+    assert len(result.segmentation) == 4
+    # ...and every run reaches the inventory and the design analysis.
+    assert len(result.design.factor_table) == 4
+
+
+def test_qc_source_is_recorded_per_run(tmp_path):
+    """
+    Recomputed per-cell values and Ranger's run-level ones are not
+    interchangeable, so which one a row came from has to travel with it.
+    """
+    from . import fixtures as fx
+
+    root = tmp_path / "study"
+    base = fx.base_gene_names(12)
+    panel_csv = fx.write_base_panel_csv(root / "base_panel.csv", base)
+
+    full = root / "runs" / "FULL_1"
+    fx.make_run(full, genes=base, n_cells=300, segmentation=fx.STAIN)
+    rows = [{"run_id": "FULL_1", "mouse_id": "MF", "section_id": "1",
+             "condition": "aged", "run_dir": str(full)}]
+
+    thin = root / "runs" / "THIN_1"
+    thin.mkdir(parents=True, exist_ok=True)
+    fx.write_metrics_summary(thin / "metrics_summary.csv", region_name="THIN_1",
+                             stain_frac=0.0)
+    rows.append({"run_id": "THIN_1", "mouse_id": "MT", "section_id": "1",
+                 "condition": "adult", "run_dir": str(thin)})
+
+    manifest_path = fx.write_manifest(root / "manifest.csv", rows)
+    result = run_audit(RunManifest.from_csv(manifest_path), panel_csv)
+
+    qc = result.cell_qc.per_run.set_index("run_id")
+    assert qc.loc["FULL_1", "qc_source"] == "cells table"
+    assert qc.loc["THIN_1", "qc_source"] == "metrics_summary.csv"
+    # Both still report a cell count and a median.
+    assert qc["n_cells"].gt(0).all()
+    assert qc["median_transcripts_per_cell"].notna().all()

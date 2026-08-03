@@ -21,7 +21,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -404,6 +404,31 @@ def _findings_html(findings: Findings) -> str:
     return "".join(out)
 
 
+def _coverage_note(
+    shown: Iterable[str], all_runs: Iterable[str], why: str, fix: str = ""
+) -> str:
+    """
+    State a section's coverage whenever it is less than the whole study.
+
+    A table silently listing 1 of 14 runs reads as "the other 13 are missing",
+    which is alarming and wrong. Saying which runs a section covers, and why the
+    rest are absent, costs one line and removes the ambiguity.
+    """
+    shown, all_runs = sorted(set(shown)), sorted(set(all_runs))
+    missing = [r for r in all_runs if r not in shown]
+    if not missing or not all_runs:
+        return ""
+    listed = ", ".join(missing[:10]) + (
+        f" and {len(missing) - 10} more" if len(missing) > 10 else ""
+    )
+    return (
+        f'<div class="note"><b>Covers {len(shown)} of {len(all_runs)} runs.</b> '
+        f"{_esc(why)} Not covered here: {_esc(listed)}."
+        + (f" {_esc(fix)}" if fix else "")
+        + "</div>"
+    )
+
+
 def _img(b64: str | None, caption: str = "") -> str:
     if not b64:
         return ""
@@ -558,8 +583,26 @@ def build_html(result: AuditResult, title: str = "Xenium dataset audit") -> str:
     )
 
     # 4. Panel
+    all_runs = (
+        design.factor_table["run_id"].tolist()
+        if design is not None and "run_id" in design.factor_table.columns
+        else result.manifest_frame.get("run_id", pd.Series(dtype=str)).tolist()
+    )
     if panel is not None and not panel.per_run.empty:
         sections.append("<h2>Gene panels</h2>")
+        sections.append(
+            _coverage_note(
+                panel.per_run["run_id"],
+                all_runs,
+                "Gene-level panel contents need a run's feature list, which only "
+                "the full bundle carries — metrics_summary.csv names the panel "
+                "design but not its genes.",
+                "Those runs still appear in the inventory, segmentation and QC "
+                "sections, and their panel_design_id is used in the design "
+                "analysis. Add one full bundle per distinct panel_design_id to "
+                "compare add-on genes.",
+            )
+        )
         sections.append(_table(panel.per_run))
         sections.append(_img(fig_panel_overlap(panel),
                              "Add-on gene presence across runs."))
@@ -577,12 +620,33 @@ def build_html(result: AuditResult, title: str = "Xenium dataset audit") -> str:
     # 5. Segmentation
     if result.segmentation is not None and not result.segmentation.empty:
         sections.append("<h2>Segmentation</h2>")
+        sections.append(
+            _coverage_note(
+                result.segmentation["run_id"], all_runs,
+                "A run needs at least one readable metadata source to be called.",
+            )
+        )
         sections.append(_table(result.segmentation))
         sections.append(_img(fig_segmentation(result.segmentation)))
 
     # 6. QC
     if result.cell_qc is not None and not result.cell_qc.per_run.empty:
         sections.append("<h2>Per-run quality</h2>")
+        sections.append(
+            _coverage_note(
+                result.cell_qc.per_run["run_id"], all_runs,
+                "Per-run quality needs a cells table or a metrics summary.",
+            )
+        )
+        _qc = result.cell_qc.per_run
+        if "qc_source" in _qc.columns and _qc["qc_source"].nunique(dropna=True) > 1:
+            sections.append(
+                '<div class="note">Runs differ in where their QC comes from '
+                "(<code>qc_source</code>): per-cell values are recomputed from "
+                "the cells table, run-level ones are taken from Ranger's "
+                "metrics_summary.csv. The two are not interchangeable — compare "
+                "within a source, not across.</div>"
+            )
         sections.append(_img(fig_qc_bars(result.cell_qc),
                              "Dashed line marks the across-run median."))
         sections.append(_table(result.cell_qc.per_run))
@@ -595,6 +659,14 @@ def build_html(result: AuditResult, title: str = "Xenium dataset audit") -> str:
         if metrics is None or metrics.pca_scores.empty:
             continue
         sections.append(f"<h2>{heading}</h2>")
+        sections.append(
+            _coverage_note(
+                metrics.pseudobulk.index, all_runs,
+                "The deep pass needs a count matrix, which only the full bundle "
+                "carries.",
+            )
+            if metrics.level == "section" else ""
+        )
         sections.append(
             '<div class="note">Descriptive only &mdash; nothing here is '
             "corrected. Restricted to the "
