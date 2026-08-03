@@ -83,15 +83,49 @@ OUTLIER_MIN_RELATIVE_DEVIATION = 0.25
 #: points at background, decoding problems or over-segmentation.
 CONTROL_RATE_WARN = 0.01
 
-#: Metrics scored for outliers across runs, and whether high values are the
-#: concerning direction.
-_OUTLIER_METRICS = (
-    "median_transcripts_per_cell",
-    "control_rate",
-    "declared_neg_control_probe_rate",
-    "transcript_density",
-    "median_cell_area",
-    "frac_cells_below_10",
+@dataclass(frozen=True)
+class OutlierMetric:
+    """
+    How to score one metric for outliers.
+
+    ``direction`` says which tail is worth reporting. For a negative-control
+    rate only the high tail means anything — a run with unusually *few* control
+    counts is unusually clean, and calling that an outlier turns good news into
+    a warning.
+
+    ``ignore_below`` is an absolute floor beneath which no run is flagged
+    however far it sits from its peers. A robust z is a statement about spread,
+    not about consequence: when every run's control rate is a hundredth of a
+    percent, one at 0.020% against a median of 0.015% is 34% away and 3.7 MADs
+    out, and means nothing at all. Without a floor, the tighter and healthier a
+    study is, the more outliers it reports.
+    """
+
+    name: str
+    direction: str = "both"          # "high" | "low" | "both"
+    ignore_below: float | None = None
+
+
+#: Metrics scored for outliers across runs.
+_OUTLIER_METRICS: tuple[OutlierMetric, ...] = (
+    # Sensitivity: both tails are informative — low means poor detection, high
+    # can mean over-merged cells.
+    OutlierMetric("median_transcripts_per_cell"),
+    OutlierMetric("transcript_density"),
+    OutlierMetric("median_cell_area"),
+    # Quality: only excess matters, and only once it is on a scale that could
+    # affect an analysis. 0.2% is an order of magnitude below CONTROL_RATE_WARN.
+    OutlierMetric("control_rate", direction="high", ignore_below=0.002),
+    # Ranger's own rate is *adjusted per control feature*, so it sits roughly an
+    # order of magnitude above the count-based control_rate above and needs its
+    # own floor. Applying the same number to both would flag healthy runs: real
+    # runs measuring 0.14-0.21% here are entirely normal.
+    OutlierMetric(
+        "declared_neg_control_probe_rate", direction="high", ignore_below=0.01
+    ),
+    # Cell loss: only excess matters, and a floor below which the filter removes
+    # a negligible slice either way.
+    OutlierMetric("frac_cells_below_10", direction="high", ignore_below=0.05),
 )
 
 
@@ -330,10 +364,11 @@ def audit_cell_qc(
         )
         return CellQC(per_run=per_run, thresholds=thresholds)
 
-    z = _robust_z(with_cells, _OUTLIER_METRICS)
+    z = _robust_z(with_cells, [m.name for m in _OUTLIER_METRICS])
 
     # -- outliers --------------------------------------------------------
-    for col in _OUTLIER_METRICS:
+    for metric in _OUTLIER_METRICS:
+        col = metric.name
         if col not in z.columns:
             continue
         values = pd.to_numeric(with_cells[col], errors="coerce")
@@ -342,8 +377,20 @@ def audit_cell_qc(
             continue
 
         rel_dev = (values - median).abs() / abs(median)
-        big_z = pd.to_numeric(z[col], errors="coerce").abs() > OUTLIER_Z
+        zs = pd.to_numeric(z[col], errors="coerce")
+        big_z = zs.abs() > OUTLIER_Z
         big_rel = rel_dev > OUTLIER_MIN_RELATIVE_DEVIATION
+
+        # Only the tail that means something.
+        if metric.direction == "high":
+            big_z &= zs > 0
+        elif metric.direction == "low":
+            big_z &= zs < 0
+
+        # ...and only once the value is on a scale that could matter.
+        if metric.ignore_below is not None:
+            big_z &= values > metric.ignore_below
+
         flagged = z.loc[(big_z & big_rel).fillna(False)]
         if flagged.empty:
             continue
@@ -356,18 +403,27 @@ def audit_cell_qc(
             }
             for r in flagged.itertuples()
         }
+        direction_note = {
+            "high": "unusually high",
+            "low": "unusually low",
+            "both": "outliers",
+        }[metric.direction]
         f.warning(
             "qc.outlier_run",
-            f"{len(flagged)} run(s) are outliers on {col} "
+            f"{len(flagged)} run(s) are {direction_note} on {col} "
             f"(|robust z| > {OUTLIER_Z} and more than "
-            f"{OUTLIER_MIN_RELATIVE_DEVIATION:.0%} from the median): "
+            f"{OUTLIER_MIN_RELATIVE_DEVIATION:.0%} from the median"
+            + (f", ignoring values below {metric.ignore_below:g}"
+               if metric.ignore_below is not None else "")
+            + "): "
             + ", ".join(
                 f"{k} ({v['value']}, {v['relative_deviation']:.0%} off, "
                 f"z={v['robust_z']})"
                 for k, v in detail.items()
             )
             + f". Study median is {_safe_scalar(median)}.",
-            evidence={"metric": col, "median": _safe_scalar(median), "runs": detail},
+            evidence={"metric": col, "direction": metric.direction,
+                      "median": _safe_scalar(median), "runs": detail},
             run_ids=sorted(detail),
         )
 

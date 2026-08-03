@@ -368,3 +368,69 @@ def test_qc_survives_a_run_with_no_cells_table(tmp_path):
 
     assert qc.per_run.iloc[0]["n_cells"] == 0
     assert f.has("qc.no_cell_tables")
+
+
+def test_unusually_clean_runs_are_not_flagged(tmp_path):
+    """
+    A run with unusually *few* control counts is unusually clean. Reporting the
+    low tail of a quality metric turns good news into a warning.
+    """
+    probes = [
+        _probe(tmp_path, f"R{i}", n_cells=1500, control_rate=0.006,
+               mean_counts_per_cell=100.0, seed=70 + i)
+        for i in range(5)
+    ]
+    probes.append(
+        _probe(tmp_path, "CLEAN", n_cells=1500, control_rate=0.0005,
+               mean_counts_per_cell=100.0, seed=99)
+    )
+
+    f = Findings()
+    qc = audit_cell_qc(probes, f).per_run.set_index("run_id")
+
+    assert qc.loc["CLEAN", "control_rate"] < qc["control_rate"].median()
+    flagged = {r for fnd in f.by_code("qc.outlier_run") for r in fnd.run_ids}
+    assert "CLEAN" not in flagged
+
+
+def test_tiny_absolute_control_rates_are_not_outliers(tmp_path):
+    """
+    Regression from the real male stratum: ten healthy runs whose control rates
+    all sit around 0.015%, one at 0.020%. That is 34% away and several MADs out,
+    and means nothing — without an absolute floor, the healthier a study is the
+    more outliers it reports.
+    """
+    probes = [
+        _probe(tmp_path, f"R{i}", n_cells=2000, control_rate=0.00015,
+               background_rate=0.0, mean_counts_per_cell=150.0, seed=80 + i)
+        for i in range(8)
+    ]
+
+    f = Findings()
+    qc = audit_cell_qc(probes, f).per_run
+
+    rates = pd.to_numeric(qc["control_rate"])
+    # The rates really do scatter by tens of percent relative to each other...
+    assert (rates.max() - rates.min()) / rates.median() > 0.25
+    # ...but every one is far below anything that could matter.
+    assert rates.max() < 0.002
+    assert not f.has("qc.outlier_run")
+
+
+def test_a_genuinely_high_control_rate_is_still_flagged(tmp_path):
+    """The floor must not suppress a real problem."""
+    probes = [
+        _probe(tmp_path, f"R{i}", n_cells=1500, control_rate=0.003,
+               mean_counts_per_cell=100.0, seed=90 + i)
+        for i in range(5)
+    ]
+    probes.append(
+        _probe(tmp_path, "BAD", n_cells=1500, control_rate=0.15,
+               mean_counts_per_cell=100.0, seed=95)
+    )
+
+    f = Findings()
+    audit_cell_qc(probes, f)
+
+    flagged = {r for fnd in f.by_code("qc.outlier_run") for r in fnd.run_ids}
+    assert "BAD" in flagged
