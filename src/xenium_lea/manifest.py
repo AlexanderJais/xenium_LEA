@@ -84,26 +84,52 @@ class RunEntry:
         return None
 
     def features_path(self) -> Path | None:
-        p = self.run_dir / _FEATURES_FILE
-        return p if p.exists() else None
+        """
+        First present feature-list container.
+
+        Xenium Ranger has shipped the feature list as features.tsv.gz, inside
+        cell_feature_matrix.zarr.zip and inside cell_feature_matrix.h5 across
+        generations, so all are accepted — see ``features.py``.
+        """
+        from .features import FEATURE_SOURCES
+
+        for rel, _ in FEATURE_SOURCES:
+            p = self.run_dir / rel
+            if p.exists():
+                return p
+        return None
 
     def experiment_path(self) -> Path | None:
         p = self.run_dir / _EXPERIMENT_FILE
         return p if p.exists() else None
 
     def matrix_path(self) -> Path | None:
-        p = self.run_dir / "cell_feature_matrix/matrix.mtx.gz"
-        return p if p.exists() else None
+        """First present count-matrix container; see ``matrix.py``."""
+        from .matrix import MATRIX_SOURCES
+
+        for rel, _ in MATRIX_SOURCES:
+            p = self.run_dir / rel
+            if p.exists():
+                return p
+        return None
 
     def file_inventory(self) -> dict[str, bool]:
         """Which known Xenium files this bundle has. Presence is diagnostic."""
-        inv = {
-            name: (self.run_dir / name).exists()
-            for name in (*_MATRIX_FILES, _FEATURES_FILE, _EXPERIMENT_FILE,
-                         *_CELLS_CANDIDATES,
-                         "cell_boundaries.parquet", "nucleus_boundaries.parquet")
+        from .features import FEATURE_SOURCES
+        from .matrix import MATRIX_SOURCES
+
+        names = {
+            *(rel for rel, _ in FEATURE_SOURCES),
+            *(rel for rel, _ in MATRIX_SOURCES),
+            *_MATRIX_FILES,
+            _EXPERIMENT_FILE,
+            *_CELLS_CANDIDATES,
+            "cell_boundaries.parquet",
+            "nucleus_boundaries.parquet",
+            "metrics_summary.csv",
+            "analysis_summary.html",
         }
-        return inv
+        return {name: (self.run_dir / name).exists() for name in sorted(names)}
 
     def to_dict(self) -> dict[str, Any]:
         d = {
@@ -337,8 +363,10 @@ class RunManifest:
             if e.features_path() is None:
                 f.error(
                     "run.features_missing",
-                    f"No cell_feature_matrix/features.tsv.gz in {e.run_dir}. "
-                    "The panel audit cannot run for this run.",
+                    f"No feature list in {e.run_dir} — looked for "
+                    "cell_feature_matrix/features.tsv.gz, "
+                    "cell_feature_matrix.zarr.zip, cell_feature_matrix.h5 and "
+                    "gene_panel.json. The panel audit cannot run for this run.",
                     evidence={"run_dir": str(e.run_dir)},
                     run_ids=[e.run_id],
                 )
@@ -364,7 +392,8 @@ class RunManifest:
             if e.matrix_path() is None:
                 f.info(
                     "run.matrix_missing",
-                    f"No cell_feature_matrix/matrix.mtx.gz in {e.run_dir}. "
+                    f"No count matrix in {e.run_dir} (matrix.mtx.gz, "
+                    "cell_feature_matrix.h5 or cell_feature_matrix.zarr.zip). "
                     "Tier-0 audit is unaffected; the --deep pseudobulk pass will "
                     "skip this run.",
                     evidence={"run_dir": str(e.run_dir)},

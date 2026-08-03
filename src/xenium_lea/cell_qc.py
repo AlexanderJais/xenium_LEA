@@ -3,12 +3,18 @@ cell_qc.py
 ----------
 Per-run quality metrics, computed from ``cells.parquet`` alone — no matrix read.
 
-The headline metric is the **negative-control rate**: control counts divided by
-total counts. It is the one quality number that is *panel-independent*, which is
-exactly what a study with differing add-on panels needs — a run's transcripts per
-cell partly reflects how many genes its panel carried, but its control rate does
-not. The sibling `xenium-spatial` loader discards these control features at load,
-so this number is currently unavailable there.
+The headline metric is the **negative-control rate**: counts on probes and
+codewords designed to bind nothing, divided by everything decoded. It is the one
+quality number that is *panel-independent*, which is exactly what a study with
+differing add-on panels needs — a run's transcripts per cell partly reflects how
+many genes its panel carried, but its negative-control rate does not. The sibling
+`xenium-spatial` loader discards these control features at load, so this number
+is currently unavailable there.
+
+Unassigned and deprecated codewords are counted separately as ``background_rate``
+rather than folded in. Which codewords fall in those classes is a property of the
+panel design and the Ranger version, so a study spanning two versions would show
+a "quality" difference that is really a nomenclature difference.
 
 Two other things this module exists to surface:
 
@@ -40,14 +46,27 @@ logger = logging.getLogger(__name__)
 #: Per-cell transcript floors previewed in the report.
 DEFAULT_COUNT_THRESHOLDS: tuple[int, ...] = (10, 20, 50)
 
-#: Control columns, excluding ``transcript_counts`` (which is RNA targets only).
-_CONTROL_COLUMNS = (
+#: True negative controls: probes and codewords designed to bind nothing. Which
+#: ones a panel carries is stable across designs, so a rate built on these is
+#: comparable between runs — the property that makes it the right cross-run
+#: quality metric in a study with differing add-on panels.
+_STRICT_CONTROL_COLUMNS = (
     "control_probe_counts",
     "control_codeword_counts",
-    "unassigned_codeword_counts",
     "genomic_control_counts",
+)
+
+#: Decoding background. Which codewords count as unassigned or deprecated is a
+#: property of the panel design and the Ranger version, so this rate is NOT
+#: comparable across runs built on different panels or software — folding it
+#: into the quality number would let a version difference read as a quality
+#: difference. Reported separately for that reason.
+_BACKGROUND_CONTROL_COLUMNS = (
+    "unassigned_codeword_counts",
     "deprecated_codeword_counts",
 )
+
+_CONTROL_COLUMNS = _STRICT_CONTROL_COLUMNS + _BACKGROUND_CONTROL_COLUMNS
 
 #: |robust z| above which a run is called an outlier on a metric.
 OUTLIER_Z = 3.0
@@ -58,10 +77,11 @@ OUTLIER_Z = 3.0
 #: while being of no practical consequence. Both bars must clear.
 OUTLIER_MIN_RELATIVE_DEVIATION = 0.25
 
-#: Control rate above which a run is flagged. 10x's own guidance treats a
-#: negative-control rate in the low percent as normal; well above that points at
-#: background, decoding problems or over-segmentation.
-CONTROL_RATE_WARN = 0.05
+#: Strict negative-control rate above which a run is flagged. Healthy Xenium
+#: runs sit far below this — a well-behaved run is typically a few hundredths of
+#: a percent — so 1% is a generous ceiling rather than a target, and crossing it
+#: points at background, decoding problems or over-segmentation.
+CONTROL_RATE_WARN = 0.01
 
 #: Metrics scored for outliers across runs, and whether high values are the
 #: concerning direction.
@@ -123,6 +143,8 @@ def _run_metrics(
             "total_transcripts": None,
             "control_counts": None,
             "control_rate": None,
+            "background_rate": None,
+            "total_control_rate": None,
             "median_cell_area": None,
             "median_nucleus_area": None,
             "frac_cells_no_nucleus": None,
@@ -147,19 +169,32 @@ def _run_metrics(
         for t in thresholds:
             row[f"frac_cells_below_{t}"] = round(float((tx.fillna(0) < t).mean()), 6)
 
-    # Control rate. Denominator is RNA + controls, so it is a genuine fraction
-    # of everything decoded rather than a ratio against RNA alone.
+    # Control rates. Denominator is RNA + every control, so each is a genuine
+    # fraction of everything decoded rather than a ratio against RNA alone.
     present_controls = [c for c in _CONTROL_COLUMNS if c in cells.columns]
     if present_controls:
-        ctrl = sum(
-            _num(cells, c).fillna(0) for c in present_controls  # type: ignore[union-attr]
-        )
-        ctrl_total = float(ctrl.sum())
+        def _sum(cols) -> float:
+            present = [c for c in cols if c in cells.columns]
+            if not present:
+                return 0.0
+            return float(
+                sum(_num(cells, c).fillna(0).sum() for c in present)  # type: ignore[union-attr]
+            )
+
+        strict_total = _sum(_STRICT_CONTROL_COLUMNS)
+        background_total = _sum(_BACKGROUND_CONTROL_COLUMNS)
+        ctrl_total = strict_total + background_total
         rna_total = float(tx.fillna(0).sum()) if tx is not None else 0.0
         denom = ctrl_total + rna_total
+
         row["control_counts"] = int(ctrl_total)
-        row["control_rate"] = round(ctrl_total / denom, 6) if denom > 0 else None
         row["control_columns_used"] = ",".join(present_controls)
+        if denom > 0:
+            # control_rate is the strict one — it is the number compared across
+            # runs, and the one the outlier check scores.
+            row["control_rate"] = round(strict_total / denom, 8)
+            row["background_rate"] = round(background_total / denom, 8)
+            row["total_control_rate"] = round(ctrl_total / denom, 8)
 
     ca = _num(cells, "cell_area")
     if ca is not None:
@@ -305,14 +340,15 @@ def audit_cell_qc(
             f.warning(
                 "qc.high_control_rate",
                 f"{len(high)} run(s) have a negative-control rate above "
-                f"{CONTROL_RATE_WARN:.0%}: "
+                f"{CONTROL_RATE_WARN:.2%}: "
                 + ", ".join(
                     f"{r.run_id} ({float(r.control_rate):.2%})"
                     for r in high.itertuples()
                 )
-                + ". High control counts point at background, decoding trouble "
-                "or over-segmentation. This is the one quality metric that does "
-                "not depend on which add-on panel a run carried.",
+                + ". High negative-control counts point at background, "
+                "decoding trouble or over-segmentation. This is the one quality "
+                "metric that does not depend on which add-on panel a run "
+                "carried, which is what makes it comparable here.",
                 evidence={
                     r.run_id: float(r.control_rate) for r in high.itertuples()
                 },
@@ -322,7 +358,12 @@ def audit_cell_qc(
             f.info(
                 "qc.control_rate_range",
                 f"Negative-control rate across runs: "
-                f"{cr.min():.2%} - {cr.max():.2%} (median {cr.median():.2%}).",
+                f"{cr.min():.3%} - {cr.max():.3%} (median {cr.median():.3%}). "
+                "This counts designed-negative probes and codewords only. "
+                "Unassigned and deprecated codewords are reported separately as "
+                "background_rate, because which codewords fall in those classes "
+                "depends on the panel design and Ranger version and so is not "
+                "comparable across runs.",
                 evidence={
                     "min": _safe_scalar(cr.min()),
                     "max": _safe_scalar(cr.max()),

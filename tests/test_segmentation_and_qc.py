@@ -123,10 +123,12 @@ def test_declared_metadata_conflicting_with_geometry_is_flagged(tmp_path):
     run = tmp_path / "R1"
     fx.make_run(run, genes=fx.base_gene_names(15), n_cells=800,
                 segmentation=fx.EXPANSION, seed=8)
-    # Overwrite the metadata with a stain-kit declaration.
+    # Replace the metadata with a stain-kit declaration and no quantitative
+    # fractions — the pre-v4 situation, where all the metadata offers is a word.
     meta = json.loads((run / "experiment.xenium").read_text())
-    meta.pop("segmentation_method", None)
-    meta.pop("nucleus_expansion_distance", None)
+    for k in list(meta):
+        if "segment" in k or "expansion" in k:
+            meta.pop(k)
     meta["segmentation"] = {"method": "multimodal cell segmentation",
                             "boundary_stain": "ATP1A1"}
     (run / "experiment.xenium").write_text(json.dumps(meta))
@@ -144,6 +146,63 @@ def test_declared_metadata_conflicting_with_geometry_is_flagged(tmp_path):
     assert f.has("segmentation.signals_disagree")
 
 
+def test_interior_stain_majority_is_called_stain(tmp_path):
+    """
+    Regression, found on a real Xenium Ranger v6 run.
+
+    A kit run labels the large majority of its cells "Segmented by interior
+    stain (18S)", a small minority by boundary stain, and falls back to nucleus
+    expansion for the rest. Matching only "boundary" saw just that minority and
+    called the whole run nucleus-expanded — inverting the kit assignment for
+    every real run.
+    """
+    p = _probe(tmp_path, "R1", n_cells=2000, segmentation=fx.STAIN, seed=31)
+
+    methods = p.cells["segmentation_method"].value_counts()
+    assert methods.idxmax().startswith("Segmented by interior stain")
+    # Expansion is present as a fallback, and outnumbers boundary stain...
+    assert methods.get("Segmented by nucleus expansion of 5.0µm", 0) > methods.get(
+        "Segmented by boundary stain (ATP1A1+CD45+E-Cadherin)", 0
+    )
+
+    _, calls = audit_segmentation([p], Findings())
+    # ...so a check that ignored interior stain would call this expansion.
+    assert calls["R1"].structural == KIT_STAIN
+    assert calls["R1"].call == KIT_STAIN
+
+
+def test_declared_fractions_drive_the_call_when_present(tmp_path):
+    """v4+ states the split outright; nothing needs inferring."""
+    p = _probe(tmp_path, "R1", n_cells=800, segmentation=fx.STAIN,
+               stain_frac=0.93, seed=32)
+    _, calls = audit_segmentation([p], Findings())
+
+    call = calls["R1"]
+    assert call.declared == KIT_STAIN
+    assert call.metrics["declared_frac_stain"] == pytest.approx(0.93)
+    assert call.metrics["declared_frac_nuc_expansion"] == pytest.approx(0.07)
+    assert call.metrics["segmentation_stain"] == "Xenium Multi-Tissue Stain"
+    assert call.confidence == "high"
+
+
+def test_stain_fraction_spread_across_kit_runs_is_flagged(tmp_path):
+    """
+    Two runs both using the kit, but resolving very different shares of the
+    section by stain — a graded technical difference in the same direction a
+    kit-vs-no-kit difference would push.
+    """
+    a = _probe(tmp_path, "R1", n_cells=800, segmentation=fx.STAIN,
+               stain_frac=0.95, seed=33)
+    b = _probe(tmp_path, "R2", n_cells=800, segmentation=fx.STAIN,
+               stain_frac=0.60, seed=34)
+
+    f = Findings()
+    table, _ = audit_segmentation([a, b], f)
+
+    assert set(table["segmentation_kit"]) == {KIT_STAIN}
+    assert f.has("segmentation.stain_fraction_spread")
+
+
 def test_too_few_cells_yields_no_morphological_call(tmp_path):
     p = _probe(tmp_path, "R1", n_cells=50, segmentation=fx.EXPANSION, seed=9)
     _, calls = audit_segmentation([p], Findings())
@@ -156,17 +215,46 @@ def test_too_few_cells_yields_no_morphological_call(tmp_path):
 
 def test_control_rate_is_computed_and_tracks_the_planted_value(tmp_path):
     p = _probe(tmp_path, "R1", n_cells=1500, control_rate=0.02,
-               mean_counts_per_cell=100.0, seed=11)
+               background_rate=0.01, mean_counts_per_cell=100.0, seed=11)
     qc = audit_cell_qc([p], Findings())
 
     row = qc.per_run.iloc[0]
-    assert row["control_rate"] == pytest.approx(0.02, abs=0.006)
+    # control_rate is the *strict* negative-control rate...
+    assert row["control_rate"] == pytest.approx(0.02, rel=0.15)
+    # ...unassigned/deprecated codewords are reported apart from it...
+    assert row["background_rate"] == pytest.approx(0.01, rel=0.20)
+    # ...and the two together make the total.
+    assert row["total_control_rate"] == pytest.approx(
+        row["control_rate"] + row["background_rate"], rel=1e-6
+    )
     assert row["control_counts"] > 0
     assert row["median_transcripts_per_cell"] > 0
 
 
+def test_background_codewords_do_not_inflate_the_quality_metric(tmp_path):
+    """
+    Two runs of identical quality, one on a panel version carrying far more
+    deprecated codewords. The strict rate must be unmoved — that is the whole
+    reason it is reported separately.
+    """
+    clean = _probe(tmp_path, "R1", n_cells=1200, control_rate=0.002,
+                   background_rate=0.002, mean_counts_per_cell=100.0, seed=21)
+    noisy = _probe(tmp_path, "R2", n_cells=1200, control_rate=0.002,
+                   background_rate=0.15, mean_counts_per_cell=100.0, seed=22)
+
+    f = Findings()
+    qc = audit_cell_qc([clean, noisy], f).per_run.set_index("run_id")
+
+    assert qc.loc["R1", "control_rate"] == pytest.approx(
+        qc.loc["R2", "control_rate"], rel=0.25
+    )
+    assert qc.loc["R2", "background_rate"] > 10 * qc.loc["R1", "background_rate"]
+    # The strict rate is what the outlier check scores, so no run is flagged.
+    assert not f.has("qc.high_control_rate")
+
+
 def test_high_control_rate_run_is_flagged(tmp_path):
-    good = _probe(tmp_path, "R1", n_cells=1200, control_rate=0.01, seed=12)
+    good = _probe(tmp_path, "R1", n_cells=1200, control_rate=0.002, seed=12)
     bad = _probe(tmp_path, "R2", n_cells=1200, control_rate=0.20, seed=13)
 
     f = Findings()

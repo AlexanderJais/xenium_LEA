@@ -57,11 +57,17 @@ def test_probe_keeps_control_features(tmp_path):
     p = probe_run(manifest[0], Findings())
 
     assert p.n_rna == 10
-    assert p.feature_type_counts["Negative Control Probe"] == 2
-    assert p.feature_type_counts["Blank Codeword"] == 2
+    # Counts are keyed by the *normalised* type, so a v4 and a v6 bundle report
+    # the same thing (see test_features.py).
+    assert p.feature_type_counts["negative_control_probe"] == 2
+    assert p.feature_type_counts["negative_control_codeword"] == 1
     assert p.n_control_features == len(fx.CONTROL_FEATURES)
+    assert p.n_strict_control_features == len(fx.STRICT_CONTROL_FEATURES)
+    assert p.n_background_control_features == len(fx.BACKGROUND_CONTROL_FEATURES)
     # ...and controls are not mistaken for genes.
-    assert not any(g.startswith(("NegControl", "BLANK")) for g in p.rna_genes)
+    assert not any(
+        g.startswith(("NegControl", "Unassigned", "Deprecated")) for g in p.rna_genes
+    )
 
 
 def test_probe_reads_cell_qc_columns(tmp_path):

@@ -40,7 +40,8 @@ import pandas as pd
 from scipy import stats
 
 from .findings import Findings
-from .probe import RNA_FEATURE_TYPE, RunProbe, _read_features
+from .matrix import find_matrix_totals
+from .probe import RunProbe
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +84,17 @@ class BatchMetrics:
 # Pseudobulk
 # ---------------------------------------------------------------------------
 
-def _cache_key(matrix_path: Path, min_counts: int) -> str:
-    st = matrix_path.stat()
-    raw = f"{matrix_path.resolve()}|{st.st_size}|{int(st.st_mtime)}|{min_counts}"
-    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+def _cache_key(run_dir: Path, min_counts: int) -> str:
+    """Fingerprint every candidate matrix container, so any edit invalidates."""
+    from .matrix import MATRIX_SOURCES
+
+    parts = [str(Path(run_dir).resolve()), str(min_counts)]
+    for rel, _ in MATRIX_SOURCES:
+        p = Path(run_dir) / rel
+        if p.exists():
+            st = p.stat()
+            parts.append(f"{rel}:{st.st_size}:{int(st.st_mtime)}")
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
 def run_pseudobulk(
@@ -104,16 +112,14 @@ def run_pseudobulk(
 
     Returns ``(gene_totals, info)`` or ``None`` when the matrix is unavailable.
     """
-    matrix_path = probe.run_dir / "cell_feature_matrix" / "matrix.mtx.gz"
-    features_path = probe.run_dir / "cell_feature_matrix" / "features.tsv.gz"
-    if not matrix_path.exists() or not features_path.exists():
-        return None
-
     cache_path = None
     if cache_dir is not None:
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = cache_dir / f"{probe.run_id}.{_cache_key(matrix_path, min_counts_per_cell)}.npz"
+        cache_path = (
+            cache_dir
+            / f"{probe.run_id}.{_cache_key(probe.run_dir, min_counts_per_cell)}.npz"
+        )
         if cache_path.exists():
             try:
                 z = np.load(cache_path, allow_pickle=True)
@@ -121,48 +127,27 @@ def run_pseudobulk(
                 info = {
                     "n_cells_total": int(z["n_cells_total"]),
                     "n_cells_used": int(z["n_cells_used"]),
+                    "source": str(z["source"]),
                     "cached": True,
                 }
                 return totals, info
             except Exception as e:  # pragma: no cover - cache is best-effort
                 logger.debug("Cache miss for %s: %s", probe.run_id, e)
 
-    import scipy.io
-    import scipy.sparse as sp
+    result, errors = find_matrix_totals(probe.run_dir, min_counts_per_cell)
+    if result is None:
+        if errors:
+            raise ValueError(
+                f"Run {probe.run_id}: every count matrix present was unreadable "
+                f"({'; '.join(errors)})."
+            )
+        return None
 
-    # MTX is genes x cells. Reducing straight to per-gene totals keeps only a
-    # length-n_genes vector, whatever the cell count.
-    mat = scipy.io.mmread(matrix_path)
-    mat = sp.csc_matrix(mat)
-
-    feats = _read_features(features_path)
-    if mat.shape[0] != len(feats):
-        raise ValueError(
-            f"Run {probe.run_id}: matrix has {mat.shape[0]} rows but "
-            f"features.tsv.gz lists {len(feats)} features."
-        )
-
-    n_cells_total = mat.shape[1]
-    if min_counts_per_cell > 0:
-        rna_rows = (feats["feature_type"] == RNA_FEATURE_TYPE).to_numpy()
-        per_cell = np.asarray(mat[rna_rows, :].sum(axis=0)).ravel()
-        keep = per_cell >= min_counts_per_cell
-        mat = mat[:, keep]
-    n_cells_used = mat.shape[1]
-
-    totals_all = np.asarray(mat.sum(axis=1)).ravel()
-
-    rna_mask = (feats["feature_type"] == RNA_FEATURE_TYPE).to_numpy()
-    genes = feats.loc[rna_mask, "gene_name"].astype(str).to_numpy()
-    values = totals_all[rna_mask]
-
-    # Duplicate symbols are summed rather than dropped: splitting one gene's
-    # counts across two columns would understate it in every downstream ratio.
-    totals = pd.Series(values, index=genes).groupby(level=0).sum()
-
+    totals = result.gene_totals
     info = {
-        "n_cells_total": int(n_cells_total),
-        "n_cells_used": int(n_cells_used),
+        "n_cells_total": result.n_cells_total,
+        "n_cells_used": result.n_cells_used,
+        "source": result.source,
         "cached": False,
     }
 
@@ -174,6 +159,7 @@ def run_pseudobulk(
                 genes=np.array(totals.index, dtype=object),
                 n_cells_total=info["n_cells_total"],
                 n_cells_used=info["n_cells_used"],
+                source=info["source"],
             )
         except Exception as e:  # pragma: no cover - cache is best-effort
             logger.debug("Could not cache %s: %s", probe.run_id, e)
@@ -214,9 +200,9 @@ def build_pseudobulk(
         totals, info = result
         rows[p.run_id] = totals.reindex(safe).fillna(0.0)
         logger.info(
-            "Pseudobulk %s: %d/%d cells used%s",
+            "Pseudobulk %s: %d/%d cells used from %s%s",
             p.run_id, info["n_cells_used"], info["n_cells_total"],
-            " (cached)" if info["cached"] else "",
+            info.get("source", "?"), " (cached)" if info["cached"] else "",
         )
 
     if skipped:

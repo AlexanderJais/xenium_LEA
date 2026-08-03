@@ -109,6 +109,13 @@ that differ in a technical factor. Same biology, differing only technically —
 the cleanest measurement of a technical effect available in the study, and worth
 knowing about before anything else.
 
+The negative-control rate is reported two ways. `control_rate` counts only
+designed-negative probes and codewords — stable across panel designs, so it is
+the number compared between runs. `background_rate` counts unassigned and
+deprecated codewords separately, because which codewords fall in those classes
+depends on the panel design and the Ranger version: folding them in would let a
+version difference read as a quality difference.
+
 ### Two decisions worth knowing about
 
 **Cross-run comparisons use only the genes present in every run.** Include a gene
@@ -129,19 +136,30 @@ over that baseline is called a driver.
 
 ## Getting data to the audit
 
-Per run, the audit reads only:
+Per run, the audit reads only three things — the panel, the cells, and the run
+metadata:
 
-```
-<run_dir>/cell_feature_matrix/{features.tsv.gz,matrix.mtx.gz,barcodes.tsv.gz}
-<run_dir>/cells.parquet          (or cells.csv[.gz])
-<run_dir>/experiment.xenium
-```
+| | Read from, in order |
+|---|---|
+| Panel | `cell_feature_matrix/features.tsv.gz` → `cell_feature_matrix.zarr.zip` → `cell_feature_matrix.h5` → `gene_panel.json` |
+| Cells | `cells.parquet` → `cells.csv.gz` → `cells.csv` |
+| Metadata | `experiment.xenium` |
+| Counts (`--deep` only) | `cell_feature_matrix/matrix.mtx.gz` → `cell_feature_matrix.h5` → `cell_feature_matrix.zarr.zip` |
 
 It never opens `transcripts.parquet`, boundary parquets, or morphology images —
 the bulk of a Xenium bundle. **Tier 0** (everything except question 7, including
-the verdict) needs only `features.tsv.gz`, `cells.parquet` and
-`experiment.xenium`: a few MB per run. `--deep` adds the count matrix and caches
-its per-gene totals, so the cost is paid once.
+the verdict) is a few MB per run. `--deep` adds the count matrix and caches its
+per-gene totals, so the cost is paid once.
+
+Xenium Ranger changed both the containers and the vocabulary across versions, so
+the audit takes whichever form is present and normalises it. That normalisation
+is not cosmetic: a v4 run labels its RNA targets `Gene Expression` and a v6 zarr
+labels them `gene`, and v6 appends a synthetic `Total transcripts` row that would
+dominate every downstream number if counted as a gene. A study spanning two
+Ranger versions would otherwise show a "panel difference" that is pure
+nomenclature. Reading the panel from a zarr needs no zarr library — the feature
+list is a plain JSON member of the archive. Only `--deep` against a zarr or `.h5`
+matrix needs the optional extras (`pip install -e ".[zarr]"` / `".[h5]"`).
 
 ---
 

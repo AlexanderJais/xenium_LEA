@@ -62,8 +62,22 @@ EXPANSION_RATIO_CV_MAX = 0.20
 #: Minimum cells needed before the morphological fingerprint means anything.
 MIN_CELLS_FOR_MORPHOLOGY = 200
 
-_EXPANSION_PATTERNS = ("expansion", "nucleus expansion", "interior - nucleus")
-_STAIN_PATTERNS = ("boundary", "interior - stain", "multimodal", "segmentation_stain")
+#: Substrings that mark a cell as nucleus-expanded, matched case-insensitively
+#: against the per-cell ``segmentation_method`` string or the declared metadata.
+_EXPANSION_PATTERNS = ("expansion", "interior - nucleus")
+
+#: Substrings that mark a cell as stain-resolved. ``interior stain`` matters:
+#: Xenium Ranger v4+ writes "Segmented by interior stain (18S)" for the large
+#: majority of cells in a kit run, and matching only "boundary" would see just
+#: the small boundary-stain minority and call the whole run nucleus-expanded.
+_STAIN_PATTERNS = (
+    "boundary",
+    "interior stain",
+    "interior - stain",
+    "multimodal",
+    "segmentation_stain",
+    "cell stain",
+)
 
 
 @dataclass
@@ -95,31 +109,63 @@ class SegmentationCall:
 
 
 def _declared_signal(probe: RunProbe) -> tuple[str, dict[str, Any]]:
-    """Read the kit off experiment.xenium, if it says anything at all."""
-    seg_keys = probe.experiment.get("segmentation_keys") or {}
+    """
+    Read the kit off experiment.xenium.
+
+    Xenium Ranger v4+ states this outright: ``segmented_cell_stain_frac`` and
+    ``segmented_cell_nuc_expansion_frac`` are the instrument's own tally of how
+    each cell was resolved. Where those exist nothing needs inferring, so they
+    are checked first and the fractions are carried into the report.
+    """
+    exp = probe.experiment or {}
+    seg_keys = exp.get("segmentation_keys") or {}
     evidence: dict[str, Any] = {
         "segmentation_keys": seg_keys,
-        "analysis_sw_version": probe.experiment.get("analysis_sw_version"),
+        "analysis_sw_version": exp.get("analysis_sw_version"),
+        "segmentation_stain": exp.get("segmentation_stain"),
     }
+
+    # 1. Quantitative fractions (v4+). Note a kit run still expands the minority
+    #    of cells where no stain resolved, so this is a majority call, not an
+    #    all-or-nothing one.
+    frac_stain = _as_float(exp.get("frac_stain"))
+    frac_expansion = _as_float(exp.get("frac_nuc_expansion"))
+    if frac_stain is not None or frac_expansion is not None:
+        evidence["declared_frac_stain"] = frac_stain
+        evidence["declared_frac_nuc_expansion"] = frac_expansion
+        s = frac_stain or 0.0
+        e = frac_expansion or 0.0
+        if s > e:
+            return KIT_STAIN, evidence
+        if e > s:
+            return KIT_EXPANSION, evidence
+
+    # 2. A named stain reagent is unambiguous even without fractions.
+    if str(exp.get("segmentation_stain") or "").strip():
+        return KIT_STAIN, evidence
+
     if not seg_keys:
         return KIT_UNKNOWN, evidence
 
+    # 3. Fall back to word-matching whatever segmentation keys exist.
     blob = " ".join(f"{k}={v}" for k, v in seg_keys.items()).lower()
-
-    # An explicit expansion *distance* is the strongest declared evidence of
-    # expansion segmentation — check it before the generic word match, since
-    # newer runs mention both (they expand only where no stain was resolved).
     has_distance = any(
         "expansion_distance" in k.lower() and _is_positive_number(v)
         for k, v in seg_keys.items()
     )
-    has_stain = any(p in blob for p in _STAIN_PATTERNS)
-
-    if has_stain:
+    if any(p in blob for p in _STAIN_PATTERNS):
         return KIT_STAIN, evidence
     if has_distance or any(p in blob for p in _EXPANSION_PATTERNS):
         return KIT_EXPANSION, evidence
     return KIT_UNKNOWN, evidence
+
+
+def _as_float(v: Any) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if np.isnan(f) else f
 
 
 def _is_positive_number(v: Any) -> bool:
@@ -305,6 +351,20 @@ def audit_segmentation(
             call = declared if declared != KIT_UNKNOWN else morphological
             confidence = "low"
 
+        # Surface the quantitative fractions in the table, not just the evidence
+        # blob: a kit run is rarely 100% stain-resolved, and *how much* of it was
+        # resolved by stain is a graded technical covariate in its own right.
+        metrics = dict(metrics)
+        metrics["declared_frac_stain"] = _round(decl_ev.get("declared_frac_stain"))
+        metrics["declared_frac_nuc_expansion"] = _round(
+            decl_ev.get("declared_frac_nuc_expansion")
+        )
+        metrics["observed_frac_stain"] = _round(struct_ev.get("frac_stain_resolved"))
+        metrics["observed_frac_expansion"] = _round(
+            struct_ev.get("frac_expansion_resolved")
+        )
+        metrics["segmentation_stain"] = decl_ev.get("segmentation_stain")
+
         calls[p.run_id] = SegmentationCall(
             run_id=p.run_id,
             call=call,
@@ -377,6 +437,8 @@ def audit_segmentation(
             "segmentation cannot contribute a batch effect here.",
         )
 
+    _report_stain_fraction_spread(table, f)
+
     # -- relative split ---------------------------------------------------
     # Absolute thresholds are conservative on purpose; a clean bimodal split in
     # the morphology across runs is meaningful even where no absolute cutoff
@@ -384,6 +446,44 @@ def audit_segmentation(
     _report_morphology_split(table, f)
 
     return table, calls
+
+
+def _report_stain_fraction_spread(table: pd.DataFrame, f: Findings) -> None:
+    """
+    Flag a graded difference in how much of each run the stain actually resolved.
+
+    Segmentation is not binary even within a kit run: some cells fall back to
+    nucleus expansion where no stain was resolved. Two runs both called
+    ``stain_kit`` can still differ substantially in that mix, which shifts cell
+    size and transcripts per cell in the same direction a kit-vs-no-kit
+    difference would — just less.
+    """
+    col = "declared_frac_stain"
+    if col not in table.columns:
+        return
+    v = pd.to_numeric(table[col], errors="coerce")
+    same_kit = table.loc[v.notna() & (table["segmentation_kit"] == KIT_STAIN)]
+    if len(same_kit) < 2:
+        return
+    vals = pd.to_numeric(same_kit[col], errors="coerce")
+    spread = float(vals.max() - vals.min())
+    if spread < 0.10:
+        return
+    f.warning(
+        "segmentation.stain_fraction_spread",
+        f"Runs called {KIT_STAIN} differ in how much of the section the stain "
+        f"actually resolved: {vals.min():.1%} to {vals.max():.1%} "
+        f"(spread {spread:.1%}). The remainder fell back to nucleus expansion, "
+        "so these runs are not equivalent even though the kit was used "
+        "throughout — treat the stain fraction as a graded technical covariate "
+        "rather than assuming a clean two-level factor.",
+        evidence={
+            "per_run": {
+                str(r.run_id): _round(getattr(r, col)) for r in same_kit.itertuples()
+            },
+            "spread": round(spread, 4),
+        },
+    )
 
 
 def _report_morphology_split(table: pd.DataFrame, f: Findings) -> None:

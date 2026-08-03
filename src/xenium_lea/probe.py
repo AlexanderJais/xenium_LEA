@@ -33,7 +33,6 @@ still surfaces in the report instead of vanishing.
 
 from __future__ import annotations
 
-import gzip
 import json
 import logging
 import re
@@ -43,27 +42,18 @@ from typing import Any
 
 import pandas as pd
 
+from .features import (
+    FEATURE_SOURCES,
+    BACKGROUND_CONTROL_TYPES,
+    GENE,
+    STRICT_CONTROL_TYPES,
+    FeatureTable,
+    find_feature_table,
+)
 from .findings import Findings
 from .manifest import RunEntry
 
 logger = logging.getLogger(__name__)
-
-# --------------------------------------------------------------------------
-# features.tsv.gz
-# --------------------------------------------------------------------------
-
-#: The feature_type value carrying real RNA targets. Everything else is control.
-RNA_FEATURE_TYPE = "Gene Expression"
-
-#: Control feature types, in the order they are reported.
-CONTROL_FEATURE_TYPES = (
-    "Negative Control Probe",
-    "Negative Control Codeword",
-    "Unassigned Codeword",
-    "Genomic Control",
-    "Blank Codeword",
-    "Deprecated Codeword",
-)
 
 # --------------------------------------------------------------------------
 # cells.parquet
@@ -127,6 +117,22 @@ _EXPERIMENT_FIELDS: dict[str, tuple[str, ...]] = {
     "num_cells":             ("num_cells", "n_cells", "cell_count"),
     "transcripts_per_cell":  ("transcripts_per_cell", "median_transcripts_per_cell"),
     "pixel_size":            ("pixel_size", "pixel_size_um"),
+    # -- fields Xenium Ranger v4+ adds. The segmentation fractions are the
+    #    strongest evidence of the method available anywhere in the bundle:
+    #    the instrument reports directly what share of cells each route
+    #    resolved, so nothing has to be inferred.
+    "panel_type":            ("panel_type",),
+    "panel_predesigned_id":  ("panel_predesigned_id",),
+    "chemistry_version":     ("chemistry_version",),
+    "segmentation_stain":    ("segmentation_stain",),
+    "frac_stain":            ("segmented_cell_stain_frac",),
+    "frac_boundary_stain":   ("segmented_cell_boundary_frac",),
+    "frac_interior_stain":   ("segmented_cell_interior_frac",),
+    "frac_nuc_expansion":    ("segmented_cell_nuc_expansion_frac",),
+    "frac_imported_cells":   ("imported_cell_frac",),
+    "fraction_transcripts_assigned": ("fraction_transcripts_assigned",),
+    "num_transcripts":       ("num_transcripts",),
+    "region_area":           ("region_area",),
 }
 
 #: Any flattened key matching this is captured under ``segmentation_keys`` —
@@ -220,10 +226,12 @@ class RunProbe:
     condition: str
     run_dir: Path
 
-    # -- panel (features.tsv.gz)
+    # -- panel (whichever container this Ranger version wrote)
     rna_genes: list[str] = field(default_factory=list)
     feature_type_counts: dict[str, int] = field(default_factory=dict)
     duplicate_gene_symbols: list[str] = field(default_factory=list)
+    features: FeatureTable | None = None
+    feature_source: str | None = None
 
     # -- run metadata (experiment.xenium)
     experiment: dict[str, Any] = field(default_factory=dict)
@@ -250,7 +258,23 @@ class RunProbe:
     @property
     def n_control_features(self) -> int:
         return sum(
-            v for k, v in self.feature_type_counts.items() if k != RNA_FEATURE_TYPE
+            v for k, v in self.feature_type_counts.items() if k != GENE
+        )
+
+    @property
+    def n_strict_control_features(self) -> int:
+        """True negative controls — comparable across panel versions."""
+        return sum(
+            v for k, v in self.feature_type_counts.items()
+            if k in STRICT_CONTROL_TYPES
+        )
+
+    @property
+    def n_background_control_features(self) -> int:
+        """Unassigned/deprecated codewords — panel-version dependent."""
+        return sum(
+            v for k, v in self.feature_type_counts.items()
+            if k in BACKGROUND_CONTROL_TYPES
         )
 
     @property
@@ -259,48 +283,6 @@ class RunProbe:
 
     def has_cell_column(self, name: str) -> bool:
         return self.cells is not None and name in self.cells.columns
-
-
-def _read_features(path: Path) -> pd.DataFrame:
-    """
-    Read features.tsv.gz.
-
-    Xenium writes three unnamed columns (gene_id, gene_name, feature_type). Some
-    exports carry a header; detect it by checking whether the first row's third
-    field is a known feature type.
-    """
-    with gzip.open(path, "rt") as fh:
-        first = fh.readline().rstrip("\n").split("\t")
-
-    known = {RNA_FEATURE_TYPE, *CONTROL_FEATURE_TYPES}
-    has_header = len(first) < 3 or first[2] not in known
-
-    df = pd.read_csv(
-        path,
-        sep="\t",
-        compression="gzip",
-        header=0 if has_header else None,
-        dtype=str,
-    )
-    if has_header:
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        rename = {}
-        for c in df.columns:
-            if "name" in c or c in ("gene", "symbol"):
-                rename[c] = "gene_name"
-            elif c in ("id", "gene_id", "ensembl_id", "feature_id"):
-                rename[c] = "gene_id"
-            elif "type" in c:
-                rename[c] = "feature_type"
-        df = df.rename(columns=rename)
-    else:
-        df.columns = (["gene_id", "gene_name", "feature_type"] +
-                      [f"extra_{i}" for i in range(len(df.columns) - 3)])
-
-    for col in ("gene_id", "gene_name", "feature_type"):
-        if col not in df.columns:
-            df[col] = ""
-    return df[["gene_id", "gene_name", "feature_type"]]
 
 
 def _read_cells(path: Path) -> tuple[pd.DataFrame, list[str]]:
@@ -361,53 +343,65 @@ def probe_run(
         return probe
 
     # -- features -------------------------------------------------------
-    features_path = entry.features_path()
-    if features_path is not None:
-        try:
-            feats = _read_features(features_path)
-            probe.feature_type_counts = (
-                feats["feature_type"].value_counts().to_dict()
+    # Whichever container this Ranger version produced; see features.py.
+    table, source_errors = find_feature_table(entry.run_dir)
+    for err in source_errors:
+        f.warning(
+            "panel.feature_source_unreadable",
+            f"A feature source in {entry.run_dir} was present but unreadable "
+            f"({err}). Falling back to the next available source.",
+            evidence={"error": err},
+            run_ids=[entry.run_id],
+        )
+
+    if table is not None:
+        probe.features = table
+        probe.feature_source = table.source
+        probe.feature_type_counts = table.type_counts
+        probe.rna_genes = table.genes
+        probe.duplicate_gene_symbols = table.duplicate_gene_names
+
+        if table.duplicate_gene_names:
+            dup = table.duplicate_gene_names
+            f.warning(
+                "panel.duplicate_gene_symbol",
+                f"{len(dup)} duplicated gene symbol(s) in {table.source} "
+                f"({', '.join(map(str, dup[:5]))}"
+                f"{' ...' if len(dup) > 5 else ''}). A de-duplicated copy is "
+                "renamed 'Foo-1' downstream and then no longer matches the "
+                "base panel by name — it becomes a phantom add-on gene.",
+                evidence={"duplicates": dup},
+                run_ids=[entry.run_id],
             )
-            rna = feats.loc[feats["feature_type"] == RNA_FEATURE_TYPE, "gene_name"]
-
-            # A duplicate symbol is not cosmetic: after the analysis pipeline's
-            # var_names_make_unique() the copy becomes "Foo-1", which no longer
-            # matches the base panel by name and is silently reclassified as a
-            # custom gene. Surface it here.
-            dup = rna[rna.duplicated()].unique().tolist()
-            probe.duplicate_gene_symbols = sorted(dup)
-            probe.rna_genes = sorted(set(rna.tolist()))
-
-            if dup:
-                f.warning(
-                    "panel.duplicate_gene_symbol",
-                    f"{len(dup)} duplicated gene symbol(s) in features.tsv.gz "
-                    f"({', '.join(map(str, dup[:5]))}"
-                    f"{' ...' if len(dup) > 5 else ''}). A de-duplicated copy is "
-                    "renamed 'Foo-1' downstream and then no longer matches the "
-                    "base panel by name — it becomes a phantom add-on gene.",
-                    evidence={"duplicates": sorted(dup)},
-                    run_ids=[entry.run_id],
-                )
-            if not probe.rna_genes:
-                probe.ok = False
-                f.error(
-                    "panel.no_rna_features",
-                    f"features.tsv.gz in {entry.run_dir} contains no "
-                    f"'{RNA_FEATURE_TYPE}' rows.",
-                    evidence={"feature_types": probe.feature_type_counts},
-                    run_ids=[entry.run_id],
-                )
-        except Exception as e:
+        if not probe.rna_genes:
             probe.ok = False
             f.error(
-                "panel.features_unreadable",
-                f"Could not read {features_path}: {type(e).__name__}: {e}",
-                evidence={"path": str(features_path)},
+                "panel.no_rna_features",
+                f"{table.source} in {entry.run_dir} contains no RNA target rows "
+                f"(feature types found: {table.raw_type_counts}).",
+                evidence={"feature_types": table.raw_type_counts},
+                run_ids=[entry.run_id],
+            )
+        if table.source == "gene_panel.json":
+            f.warning(
+                "panel.from_design_file",
+                f"The panel for this run was read from gene_panel.json because "
+                "no matrix-side feature list was found. That file records what "
+                "was ordered, not what the run measured, and carries no control "
+                "codewords — so control-based quality metrics are unavailable "
+                "for this run.",
                 run_ids=[entry.run_id],
             )
     else:
         probe.ok = False
+        f.error(
+            "panel.features_missing",
+            f"No readable feature list in {entry.run_dir}. Looked for: "
+            + ", ".join(rel for rel, _ in FEATURE_SOURCES)
+            + ".",
+            evidence={"run_dir": str(entry.run_dir), "errors": source_errors},
+            run_ids=[entry.run_id],
+        )
 
     # -- experiment.xenium ----------------------------------------------
     exp_path = entry.experiment_path()

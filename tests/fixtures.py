@@ -30,13 +30,31 @@ import pandas as pd
 EXPANSION = "expansion"
 STAIN = "stain"
 
-CONTROL_FEATURES = [
+#: True negative controls — designed to bind nothing. These drive the strict
+#: negative-control rate, the metric that is comparable across panel versions.
+STRICT_CONTROL_FEATURES = [
     ("NegControlProbe_00042", "NegControlProbe_00042", "Negative Control Probe"),
     ("NegControlProbe_00043", "NegControlProbe_00043", "Negative Control Probe"),
     ("NegControlCodeword_0500", "NegControlCodeword_0500", "Negative Control Codeword"),
-    ("BLANK_0001", "BLANK_0001", "Blank Codeword"),
-    ("BLANK_0002", "BLANK_0002", "Blank Codeword"),
 ]
+
+#: Decoding background — which codewords are unassigned or deprecated depends on
+#: the panel design and Ranger version, so these are counted separately.
+BACKGROUND_CONTROL_FEATURES = [
+    ("UnassignedCodeword_0498", "UnassignedCodeword_0498", "Unassigned Codeword"),
+    ("DeprecatedCodeword_0334", "DeprecatedCodeword_0334", "Deprecated Codeword"),
+]
+
+CONTROL_FEATURES = STRICT_CONTROL_FEATURES + BACKGROUND_CONTROL_FEATURES
+
+#: Xenium Ranger v6 zarr uses a different vocabulary for the same things.
+V6_TYPE_VOCAB = {
+    "Gene Expression": "gene",
+    "Negative Control Probe": "negative_control_probe",
+    "Negative Control Codeword": "negative_control_codeword",
+    "Unassigned Codeword": "unassigned_codeword",
+    "Deprecated Codeword": "deprecated_codeword",
+}
 
 
 def base_gene_names(n: int = 40) -> list[str]:
@@ -82,6 +100,7 @@ def make_run(
     segmentation: str = STAIN,
     seed: int = 0,
     control_rate: float = 0.01,
+    background_rate: float = 0.005,
     mean_counts_per_cell: float = 60.0,
     cells_format: str = "parquet",
     include_experiment: bool = True,
@@ -91,6 +110,7 @@ def make_run(
     panel_name: str = "Xenium Mouse Brain Panel v1.1",
     gene_scale: dict[str, float] | None = None,
     zero_transcript_frac: float = 0.0,
+    stain_frac: float = 0.93,
 ) -> Path:
     """
     Write one synthetic Xenium bundle.
@@ -132,9 +152,20 @@ def make_run(
     if n_zero:
         matrix[: len(genes), :n_zero] = 0
 
-    n_control = len(CONTROL_FEATURES)
-    control_lambda = max(control_rate * mean_counts_per_cell / n_control, 1e-6)
-    matrix[len(genes):, :] = rng.poisson(control_lambda, size=(n_control, n_cells))
+    n_strict = len(STRICT_CONTROL_FEATURES)
+    n_background = len(BACKGROUND_CONTROL_FEATURES)
+    strict_lambda = max(control_rate * mean_counts_per_cell / n_strict, 1e-9)
+    background_lambda = max(
+        background_rate * mean_counts_per_cell / n_background, 1e-9
+    )
+    strict_start = len(genes)
+    background_start = strict_start + n_strict
+    matrix[strict_start:background_start, :] = rng.poisson(
+        strict_lambda, size=(n_strict, n_cells)
+    )
+    matrix[background_start:, :] = rng.poisson(
+        background_lambda, size=(n_background, n_cells)
+    )
 
     _write_mtx(run_dir / "cell_feature_matrix" / "matrix.mtx.gz", matrix)
 
@@ -150,11 +181,23 @@ def make_run(
         radius = np.sqrt(nucleus_area / np.pi)
         cell_area = np.pi * (radius + d) ** 2
         cell_area *= rng.normal(1.0, 0.01, size=n_cells)  # tiny measurement noise
-        seg_method = np.array(["Interior - Nucleus expansion"] * n_cells)
+        seg_method = np.array(["Segmented by nucleus expansion of 5.0\u00b5m"] * n_cells)
     else:
         # Traced membrane: area independent of the nucleus.
         cell_area = rng.gamma(shape=4.0, scale=45.0, size=n_cells) + 40.0
-        seg_method = np.array(["Boundary"] * n_cells)
+        # Real kit runs resolve most cells by *interior* stain, a minority by
+        # boundary stain, and fall back to nucleus expansion for the rest.
+        seg_method = np.array(
+            ["Segmented by interior stain (18S)"] * n_cells, dtype=object
+        )
+        n_boundary = int(0.02 * n_cells)
+        n_fallback = int(0.07 * n_cells)
+        seg_method[:n_boundary] = (
+            "Segmented by boundary stain (ATP1A1+CD45+E-Cadherin)"
+        )
+        seg_method[n_boundary: n_boundary + n_fallback] = (
+            "Segmented by nucleus expansion of 5.0\u00b5m"
+        )
 
     cells = pd.DataFrame(
         {
@@ -162,13 +205,18 @@ def make_run(
             "x_centroid": rng.uniform(0, 4000, n_cells).astype(np.float32),
             "y_centroid": rng.uniform(0, 4000, n_cells).astype(np.float32),
             "transcript_counts": rna_counts.astype(np.int32),
-            "control_probe_counts": matrix[len(genes): len(genes) + 2, :]
+            "control_probe_counts": matrix[strict_start: strict_start + 2, :]
             .sum(axis=0)
             .astype(np.int32),
-            "control_codeword_counts": matrix[len(genes) + 2: len(genes) + 3, :]
+            "control_codeword_counts": matrix[strict_start + 2: background_start, :]
             .sum(axis=0)
             .astype(np.int32),
-            "unassigned_codeword_counts": matrix[len(genes) + 3:, :]
+            "unassigned_codeword_counts": matrix[
+                background_start: background_start + 1, :
+            ]
+            .sum(axis=0)
+            .astype(np.int32),
+            "deprecated_codeword_counts": matrix[background_start + 1:, :]
             .sum(axis=0)
             .astype(np.int32),
             "total_counts": (rna_counts + control_counts).astype(np.int32),
@@ -215,18 +263,70 @@ def make_run(
             "pixel_size": 0.2125,
         }
         if segmentation == STAIN:
-            meta["segmentation"] = {
-                "method": "multimodal cell segmentation",
-                "boundary_stain": "ATP1A1/CD45/E-Cadherin",
-                "interior_stain": "18S",
-                "nucleus_expansion_distance": 0,
-            }
+            meta["segmentation_stain"] = "Xenium Multi-Tissue Stain"
+            meta["segmented_cell_stain_frac"] = stain_frac
+            meta["segmented_cell_boundary_frac"] = round(stain_frac * 0.023, 6)
+            meta["segmented_cell_interior_frac"] = round(stain_frac * 0.977, 6)
+            meta["segmented_cell_nuc_expansion_frac"] = round(1.0 - stain_frac, 6)
+            meta["imported_cell_frac"] = 0.0
         else:
             meta["segmentation_method"] = "nucleus expansion"
             meta["nucleus_expansion_distance"] = 5.0
+            meta["segmented_cell_stain_frac"] = 0.0
+            meta["segmented_cell_nuc_expansion_frac"] = 1.0
         (run_dir / "experiment.xenium").write_text(json.dumps(meta, indent=2))
 
     return run_dir
+
+
+def write_zarr_features(
+    path: Path,
+    genes: Sequence[str],
+    n_cells: int = 100,
+    include_aggregate: bool = True,
+) -> Path:
+    """
+    Write a minimal ``cell_feature_matrix.zarr.zip`` carrying only the feature
+    list, in the v6 layout and vocabulary.
+
+    The audit reads the panel from ``cell_features/.zattrs``, which is plain JSON
+    inside the zip, so no zarr library is involved and a metadata-only fixture is
+    enough to exercise that path. ``include_aggregate`` appends the synthetic
+    ``Total transcripts`` row that v6 adds and the audit must drop.
+    """
+    import zipfile
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    ids = [f"ENSMUSG_{g}" for g in genes]
+    keys = list(genes)
+    types = ["gene"] * len(genes)
+
+    for fid, name, ftype in CONTROL_FEATURES:
+        ids.append(fid)
+        keys.append(name)
+        types.append(V6_TYPE_VOCAB[ftype])
+
+    if include_aggregate:
+        ids.append("Total transcripts")
+        keys.append("Total transcripts")
+        types.append("aggregate_gene")
+
+    attrs = {
+        "feature_ids": ids,
+        "feature_keys": keys,
+        "feature_types": types,
+        "major_version": 4,
+        "minor_version": 1,
+        "number_cells": n_cells,
+        "number_features": len(ids),
+    }
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(".zgroup", json.dumps({"zarr_format": 2}))
+        z.writestr("cell_features/.zgroup", json.dumps({"zarr_format": 2}))
+        z.writestr("cell_features/.zattrs", json.dumps(attrs, indent=2))
+    return path
 
 
 def write_manifest(

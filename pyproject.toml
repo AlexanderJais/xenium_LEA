@@ -31,7 +31,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# Extra count-matrix containers. Neither is needed when a run ships the classic
+# cell_feature_matrix/ folder — and the *panel* is read from a zarr zip without
+# either, since the feature list is a plain JSON member of the archive.
+h5 = ["h5py>=3.10"]
+zarr = ["zarr>=2.16", "numcodecs>=0.12"]
+dev = [
+    "xenium-lea[h5,zarr]",
+    "pytest>=8.0",
+]
 
 [project.scripts]
 xenium-lea = "xenium_lea.cli:main"
