@@ -39,6 +39,7 @@ Nothing here is corrected or modelled away. The output is a verdict.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -55,18 +56,53 @@ PARTIAL = "PARTIAL"
 NESTED = "NESTED"
 ALIASED = "ALIASED"
 
+#: A factor with a distinct level for every run. It identifies the sample rather
+#: than grouping samples, so it carries no batch information: its "effect" is
+#: just the residual, and it cannot be adjusted for without fitting one
+#: parameter per observation. Reported, but kept out of the verdict — otherwise
+#: any study where each section was its own instrument run would read as
+#: confounded on that ground alone.
+PER_RUN = "PER_RUN"
+
+#: A factor that groups the runs, in a study with no biological contrast to
+#: test it against. Says nothing about separability — there is nothing to
+#: separate from — but it is still the technical block structure, and it is what
+#: will decide the verdict once conditions are known.
+GROUPING = "GROUPING"
+
+#: A factor whose value is unknown for most runs. The split it produces tracks
+#: which files were available, not anything about the experiment, so it is
+#: reported and then kept out of the verdict and out of the alias clusters.
+#: Without this, a partially-assembled study reports a confident batch boundary
+#: that is really the boundary between uploaded and not-yet-uploaded bundles.
+UNKNOWN_DOMINATED = "UNKNOWN_DOMINATED"
+
+#: Placeholder written by ``build_factor_table`` when a field cannot be read.
+UNKNOWN_LEVEL = "unknown"
+
+#: Fraction of runs that may be ``unknown`` before a factor is disqualified.
+MAX_UNKNOWN_FRACTION = 0.25
+
 OVERALL_OK = "OK"
 OVERALL_CAUTION = "CAUTION"
 OVERALL_BLOCKED = "BLOCKED"
+
+#: Fewer than two conditions: the separability question is not yet answerable.
+#: Reported rather than guessed, because a single-level condition column makes
+#: every factor look trivially nested within it.
+OVERALL_NO_CONTRAST = "NO_CONTRAST"
 
 #: Columns treated as technical factors. ``mouse_id`` is excluded: it is nested
 #: within condition by design, and that nesting is correct rather than a defect.
 TECHNICAL_FACTORS = (
     "panel_group",
+    "panel_design_id",
     "segmentation_kit",
+    "run_name",
     "analysis_sw_version",
     "instrument_sw_version",
     "instrument_sn",
+    "chemistry_version",
     "run_date",
     "panel_name",
     "cells_source",
@@ -143,8 +179,17 @@ def classify_factor(factor: Iterable, condition: Iterable) -> str:
     fac = pd.Series(list(factor), dtype="object")
     con = pd.Series(list(condition), dtype="object")
 
-    if fac.nunique(dropna=False) <= 1:
+    n_levels = fac.nunique(dropna=False)
+    if n_levels <= 1:
         return CONSTANT
+    if n_levels == len(fac) and len(fac) > 1:
+        # One level per run: this labels the sample, it does not group samples.
+        return PER_RUN
+    if con.nunique(dropna=False) <= 1:
+        # No biological contrast, so nothing to be confounded *with*. Without
+        # this guard every factor determines the (constant) condition and would
+        # be reported as nested within it — true but vacuous.
+        return GROUPING
 
     varies = fac.groupby(con.values, dropna=False).nunique(dropna=False) > 1
     if not varies.any():
@@ -192,6 +237,7 @@ class DesignAudit:
     verdicts: dict[str, FactorVerdict] = field(default_factory=dict)
     factor_pairs: list[dict[str, Any]] = field(default_factory=list)
     within_mouse: list[dict[str, Any]] = field(default_factory=list)
+    alias_clusters: list[list[str]] = field(default_factory=list)
     replicates: dict[str, dict[str, int]] = field(default_factory=dict)
     overall: str = OVERALL_OK
     condition_levels: list[str] = field(default_factory=list)
@@ -223,6 +269,7 @@ class DesignAudit:
             "replicates": self.replicates,
             "factors": {k: v.to_dict() for k, v in self.verdicts.items()},
             "factor_pairs": self.factor_pairs,
+            "alias_clusters": self.alias_clusters,
             "within_mouse_contrasts": self.within_mouse,
             "n_runs": int(len(self.factor_table)),
             "n_mice": (
@@ -268,16 +315,39 @@ def build_factor_table(
             "section_id": p.section_id,
             "condition": p.condition,
             "panel_group": (panel_groups or {}).get(p.run_id, "unknown"),
+            # panel_design_id names the *custom add-on* design. Two runs can
+            # share panel_name and predesigned base and still carry different
+            # add-on genes, so this discriminates where panel_name cannot — and
+            # it works from metrics_summary.csv alone, without any gene list.
+            "panel_design_id": _clean(exp.get("panel_design_id")),
             "segmentation_kit": seg_by_run.get(p.run_id, "unknown"),
+            # The instrument run is the batch in the ordinary sense: sections
+            # processed together share reagents, operator and machine state.
+            "run_name": _clean(exp.get("run_name")),
             "analysis_sw_version": _clean(exp.get("analysis_sw_version")),
             "instrument_sw_version": _clean(exp.get("instrument_sw_version")),
             "instrument_sn": _clean(exp.get("instrument_sn")),
-            "run_date": _date_only(exp.get("run_start_time")),
+            "chemistry_version": _clean(exp.get("chemistry_version")),
+            "run_date": _date_only(
+                exp.get("run_start_time") or _date_from_run_name(exp.get("run_name"))
+            ),
             "panel_name": _clean(exp.get("panel_name")),
+            "panel_predesigned_id": _clean(exp.get("panel_predesigned_id")),
             "preservation_method": _clean(exp.get("preservation_method")),
             "cells_source": _clean(p.cells_source),
-            "n_cells": p.n_cells,
+            "region_name": _clean(exp.get("region_name")),
+            "n_cells": p.n_cells or _int_or_none(exp.get("num_cells")),
             "n_rna_targets": p.n_rna,
+            # Continuous technical covariates. Not classified as factors — they
+            # have a level per run — but they belong in the inventory because
+            # each shifts downstream numbers and none is visible in the matrix.
+            "stain_frac": _num_or_none(exp.get("frac_stain")),
+            "section_thickness": _num_or_none(exp.get("section_thickness")),
+            "transcript_density": _num_or_none(exp.get("transcript_density")),
+            "frac_transcripts_assigned": _num_or_none(
+                exp.get("fraction_transcripts_assigned")
+            ),
+            "total_cell_area": _num_or_none(exp.get("total_cell_area")),
         }
         for k, v in overrides_by_run.get(p.run_id, {}).items():
             if k in row and str(row[k]) not in ("unknown", "None", ""):
@@ -308,6 +378,36 @@ def _date_only(v: Any) -> str:
     return s[:10] if len(s) >= 10 else s
 
 
+_RUN_NAME_DATE_RE = re.compile(r"(20\d{2})[-_]?(\d{2})[-_]?(\d{2})")
+
+
+def _date_from_run_name(run_name: Any) -> str | None:
+    """
+    Recover the run date from a run name like ``20250626_Xv1_Lea_Run1``.
+
+    ``metrics_summary.csv`` carries no timestamp, so for a metrics-only run this
+    is the only way to place it in time — and run date is often the factor that
+    separates one processing batch from another.
+    """
+    if not run_name:
+        return None
+    m = _RUN_NAME_DATE_RE.search(str(run_name))
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+
+
+def _num_or_none(v: Any) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if np.isnan(f) else round(f, 6)
+
+
+def _int_or_none(v: Any) -> int | None:
+    n = _num_or_none(v)
+    return None if n is None else int(n)
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -334,6 +434,7 @@ def audit_design(
     )
 
     # -- factor vs condition ---------------------------------------------
+    unknown_dominated: dict[str, int] = {}
     considered = [
         c for c in factors
         if c in factor_table.columns
@@ -343,7 +444,18 @@ def audit_design(
     for col in considered:
         values = factor_table[col].astype(str)
         levels = sorted(values.unique())
-        verdict = classify_factor(values, condition)
+        n_unknown = int((values == UNKNOWN_LEVEL).sum())
+
+        if (
+            n_unknown
+            and len(levels) > 1
+            and n_unknown > MAX_UNKNOWN_FRACTION * len(values)
+        ):
+            # Unknown for most runs: the split reflects which files were
+            # uploaded, not the experiment.
+            verdict = UNKNOWN_DOMINATED
+        else:
+            verdict = classify_factor(values, condition)
         v_stat = cramers_v(values, condition)
 
         by_cond = {
@@ -403,11 +515,43 @@ def audit_design(
         elif verdict == CROSSED:
             f.info("design.factor_crossed", message,
                    evidence={"factor": col, "levels_by_condition": by_cond})
+        elif verdict == PER_RUN:
+            f.info(
+                "design.factor_per_run",
+                message,
+                evidence={"factor": col, "n_levels": len(levels)},
+            )
+        elif verdict == UNKNOWN_DOMINATED:
+            unknown_dominated[col] = n_unknown
+        elif verdict == GROUPING:
+            f.info(
+                "design.factor_grouping",
+                message,
+                evidence={"factor": col, "levels": levels,
+                          "runs_per_level": {
+                              str(k): int(v) for k, v in
+                              values.value_counts().items()}},
+            )
+
+    if unknown_dominated:
+        # One fact, however many fields it touches: these all come from the same
+        # missing files.
+        f.warning(
+            "design.factors_unknown_dominated",
+            f"{len(unknown_dominated)} factor(s) are unknown for most runs and "
+            f"are excluded from the verdict: {', '.join(sorted(unknown_dominated))}. "
+            "The groups they form track which files have been uploaded rather "
+            "than anything about the experiment, so treating them as batch "
+            "factors would invent a boundary. Supplying the missing "
+            "experiment.xenium files makes them informative.",
+            evidence={"factors": unknown_dominated, "n_runs": len(factor_table)},
+        )
 
     # -- factor vs factor --------------------------------------------------
     varying = [
         c for c in considered
-        if audit.verdicts[c].verdict != CONSTANT
+        if audit.verdicts[c].verdict
+        not in (CONSTANT, PER_RUN, UNKNOWN_DOMINATED)
     ]
     for i, a in enumerate(varying):
         for b in varying[i + 1:]:
@@ -423,16 +567,11 @@ def audit_design(
                 "cramers_v": round(cramers_v(va, vb), 4),
             }
             audit.factor_pairs.append(pair)
-            if aliased:
-                f.warning(
-                    "design.factors_aliased",
-                    f"'{a}' and '{b}' are perfectly aliased with each other — "
-                    "they change together across every run. Even where each is "
-                    "separable from condition, an effect attributed to one could "
-                    "equally be the other; they cannot be told apart in this "
-                    "dataset.",
-                    evidence=pair,
-                )
+
+    # Aliasing is transitive, so report equivalence *classes* rather than every
+    # pair: eleven factors moving together is one fact about the study, not
+    # fifty-five separate warnings.
+    _report_alias_clusters(audit, f)
 
     # -- within-mouse contrasts --------------------------------------------
     audit.within_mouse = _within_mouse_contrasts(factor_table, varying)
@@ -462,7 +601,9 @@ def audit_design(
     # effect cannot be attributed to one of them rather than the other, which
     # never threatens the condition comparison.
     verdict_values = {v.verdict for v in audit.verdicts.values()}
-    if ALIASED in verdict_values:
+    if len(cond_levels) < 2:
+        audit.overall = OVERALL_NO_CONTRAST
+    elif ALIASED in verdict_values:
         audit.overall = OVERALL_BLOCKED
     elif PARTIAL in verdict_values or NESTED in verdict_values:
         audit.overall = OVERALL_CAUTION
@@ -471,6 +612,60 @@ def audit_design(
 
     _report_overall(audit, f)
     return audit
+
+
+def _alias_clusters(pairs: list[dict[str, Any]]) -> list[list[str]]:
+    """
+    Group factors into sets that are mutually indistinguishable.
+
+    Aliasing is an equivalence relation, so the pairs collapse to connected
+    components — union-find over the aliased edges.
+    """
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: str, y: str) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    for p in pairs:
+        if p["aliased"]:
+            union(p["factor_a"], p["factor_b"])
+
+    groups: dict[str, list[str]] = {}
+    for node in parent:
+        groups.setdefault(find(node), []).append(node)
+    return [sorted(g) for g in groups.values() if len(g) > 1]
+
+
+def _report_alias_clusters(audit: DesignAudit, f: Findings) -> None:
+    """One finding per set of mutually indistinguishable factors."""
+    clusters = _alias_clusters(audit.factor_pairs)
+    audit.alias_clusters = clusters
+    if not clusters:
+        return
+
+    for group in sorted(clusters, key=len, reverse=True):
+        levels = {
+            g: audit.verdicts[g].levels for g in group if g in audit.verdicts
+        }
+        f.warning(
+            "design.factors_aliased",
+            f"{len(group)} factors change together across every run and are "
+            f"therefore indistinguishable: {', '.join(group)}. They partition "
+            "the runs the same way, so an effect attributed to one could equally "
+            "be any of the others — no analysis of this dataset can say which. "
+            "In practice this is one batch boundary wearing several names; treat "
+            "it as a single factor and be explicit about that in any writeup.",
+            evidence={"factors": group, "levels": levels},
+        )
 
 
 def _replicate_counts(table: pd.DataFrame) -> dict[str, dict[str, int]]:
@@ -519,6 +714,29 @@ def _verdict_message(
         return (
             f"'{factor}' is constant across the study ({shown}) — it cannot "
             "contribute a batch effect."
+        )
+    if verdict == UNKNOWN_DOMINATED:
+        return (
+            f"'{factor}' is unknown for most runs, so the groups it forms track "
+            "which files have been uploaded rather than anything about the "
+            "experiment. Excluded from the verdict and from the aliasing "
+            "analysis; supply the missing experiment.xenium files to make it "
+            "informative."
+        )
+    if verdict == GROUPING:
+        return (
+            f"'{factor}' splits the runs into {len(levels)} group(s) ({shown}). "
+            "Whether that threatens the analysis depends entirely on how the "
+            "biological conditions fall across those groups — supply the "
+            "condition column to get a separability verdict."
+        )
+    if verdict == PER_RUN:
+        return (
+            f"'{factor}' has a distinct value for every run ({len(levels)} "
+            "levels). It labels the sample rather than grouping samples, so it "
+            "carries no batch information — its 'effect' is the residual, and "
+            "adjusting for it would fit one parameter per observation. Excluded "
+            "from the verdict."
         )
     if verdict == CROSSED:
         return (
@@ -608,6 +826,21 @@ def _report_overall(audit: DesignAudit, f: Findings) -> None:
                 "nested_factors": nested,
                 "factor_pairs": audit.factor_pairs,
             },
+        )
+    elif audit.overall == OVERALL_NO_CONTRAST:
+        grouping = [k for k, v in audit.verdicts.items() if v.verdict == GROUPING]
+        f.warning(
+            "design.verdict_no_contrast",
+            "SEPARABILITY VERDICT: NOT YET ANSWERABLE. Every run carries the "
+            "same condition label, so there is no biological contrast to protect "
+            "and nothing can be confounded with it. The technical block "
+            "structure is reported above"
+            + (f" ({', '.join(grouping)} each group the runs)" if grouping else "")
+            + " — fill in the condition column and re-run to find out whether "
+            "those blocks line up with the biology. If they do, the comparison "
+            "is not recoverable; if they cross it, it is.",
+            evidence={"grouping_factors": grouping,
+                      "alias_clusters": audit.alias_clusters},
         )
     else:
         f.info(

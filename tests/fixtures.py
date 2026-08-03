@@ -329,6 +329,107 @@ def write_zarr_features(
     return path
 
 
+#: metrics_summary.csv as Xenium Ranger actually writes it. Values are taken
+#: from a real run so the parser is exercised against real formatting, including
+#: the empty columns a no-stain run leaves behind.
+_METRICS_TEMPLATE = {
+    "run_name": "20250626_Xv1_Lea_Droppman_Run1",
+    "cassette_name": "Slide1",
+    "region_name": "F536_1",
+    "panel_name": "mBrain_50g",
+    "panel_design_id": "7ZBFXR",
+    "predesigned_panel_id": "mBrain_v1.1",
+    "region_area": 58980160.716,
+    "total_cell_area": 21340410.528,
+    "total_high_quality_decoded_transcripts": 40498440,
+    "fraction_transcripts_decoded_q20": 0.9616,
+    "nuclear_transcripts_per_100um2": 272.55,
+    "decoded_transcripts_per_100um2": 149.39,
+    "adjusted_negative_control_probe_rate": 0.00153,
+    "adjusted_negative_control_codeword_rate": 0.000405,
+    "adjusted_genomic_control_probe_rate": "",
+    "estimated_number_of_false_positive_transcripts_per_cell": 0.3234,
+    "num_cells_detected": 123654,
+    "fraction_empty_cells": 0.000817,
+    "cells_per_100um2": 0.2097,
+    "fraction_transcripts_assigned": 0.7872,
+    "median_genes_per_cell": 61,
+    "median_transcripts_per_cell": 172,
+    "thickness_transcripts_high_quality": 5.554,
+    "stain_definition": "",
+    "segmented_cell_stain_frac": 0.0,
+    "segmented_cell_boundary_frac": 0.0,
+    "segmented_cell_interior_frac": 0.0,
+    "segmented_cell_nuc_expansion_frac": 1.0,
+    "segmented_cell_imported_frac": "",
+}
+
+
+def write_metrics_summary(
+    path: Path,
+    region_name: str = "F536_1",
+    run_name: str = "20250626_Xv1_Lea_Droppman_Run1",
+    panel_design_id: str = "7ZBFXR",
+    stain_frac: float = 0.0,
+    **overrides,
+) -> Path:
+    """
+    Write a ``metrics_summary.csv`` for one run.
+
+    ``stain_frac`` drives the segmentation columns coherently: a kit run reports
+    a stain definition and splits the remainder into nucleus expansion, while a
+    no-kit run reports 100% expansion and leaves the stain columns blank — which
+    is exactly what distinguishes the two generations in the real data.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    row = dict(_METRICS_TEMPLATE)
+    row["region_name"] = region_name
+    row["run_name"] = run_name
+    row["panel_design_id"] = panel_design_id
+    row["segmented_cell_stain_frac"] = stain_frac
+    row["segmented_cell_nuc_expansion_frac"] = round(1.0 - stain_frac, 6)
+    if stain_frac > 0:
+        row["stain_definition"] = "xenium_cell_segmentation_stains_v1"
+        row["segmented_cell_boundary_frac"] = round(stain_frac * 0.06, 6)
+        row["segmented_cell_interior_frac"] = round(stain_frac * 0.94, 6)
+    row.update(overrides)
+
+    pd.DataFrame([row]).to_csv(path, index=False)
+    return path
+
+
+def build_metrics_study(root: Path, design: Sequence[tuple]) -> tuple[Path, Path]:
+    """
+    Build a study of metrics-only run directories.
+
+    Each entry is ``(run_id, mouse_id, condition, run_name, panel_design_id,
+    stain_frac)``. Returns ``(manifest_path, base_panel_csv)``.
+    """
+    root = Path(root)
+    panel_csv = write_base_panel_csv(root / "base_panel.csv", base_gene_names(20))
+
+    rows = []
+    for run_id, mouse_id, condition, run_name, design_id, stain in design:
+        d = root / "runs" / run_id
+        d.mkdir(parents=True, exist_ok=True)
+        write_metrics_summary(
+            d / "metrics_summary.csv",
+            region_name=run_id,
+            run_name=run_name,
+            panel_design_id=design_id,
+            stain_frac=stain,
+        )
+        rows.append(
+            {"run_id": run_id, "mouse_id": mouse_id,
+             "section_id": run_id.rpartition("_")[2] or "s1",
+             "condition": condition, "run_dir": str(d)}
+        )
+
+    return write_manifest(root / "manifest.csv", rows), panel_csv
+
+
 def write_manifest(
     path: Path,
     rows: Sequence[dict],

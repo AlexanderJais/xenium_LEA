@@ -52,6 +52,7 @@ from .features import (
 )
 from .findings import Findings
 from .manifest import RunEntry
+from .metrics import find_metrics_summary, read_metrics_summary
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +237,10 @@ class RunProbe:
     # -- run metadata (experiment.xenium)
     experiment: dict[str, Any] = field(default_factory=dict)
 
+    # -- Ranger's own QC sheet (metrics_summary.csv)
+    metrics: dict[str, Any] = field(default_factory=dict)
+    metrics_source: str | None = None
+
     # -- cells (cells.parquet)
     cells: pd.DataFrame | None = None
     cells_source: str | None = None
@@ -318,6 +323,57 @@ def _read_cells(path: Path) -> tuple[pd.DataFrame, list[str]]:
     return df, available
 
 
+
+def _merge_metrics(probe: "RunProbe", f: Findings, run_id: str) -> None:
+    """
+    Fold ``metrics_summary.csv`` into the run's metadata.
+
+    ``experiment.xenium`` wins where both describe the same field — it is
+    written by the instrument for that run — and the metrics sheet fills every
+    gap. Where the two disagree on something that matters, the disagreement is
+    reported rather than silently resolved: a mismatch means one of the files
+    does not belong to this bundle, which would quietly corrupt the inventory.
+    """
+    metrics = probe.metrics
+    exp = probe.experiment
+
+    checked = ("run_name", "region_name", "panel_design_id", "panel_name",
+               "panel_predesigned_id")
+    conflicts = {}
+    for key in checked:
+        a, b = exp.get(key), metrics.get(key)
+        if a is not None and b is not None and str(a).strip() != str(b).strip():
+            conflicts[key] = {"experiment.xenium": a, "metrics_summary.csv": b}
+
+    if conflicts:
+        f.warning(
+            "run.metadata_conflict",
+            f"experiment.xenium and {probe.metrics_source} disagree on "
+            f"{', '.join(conflicts)}. One of the two files may not belong to "
+            "this run directory — check before trusting the inventory row. "
+            "experiment.xenium is used where they differ.",
+            evidence=conflicts,
+            run_ids=[run_id],
+        )
+
+    for key, value in metrics.items():
+        if key in ("raw_keys", "parse_error"):
+            continue
+        if value is not None and exp.get(key) is None:
+            exp[key] = value
+
+    # Give the segmentation audit the same shape of evidence it gets from
+    # experiment.xenium, so a metrics-only run is called the same way.
+    seg_keys = dict(exp.get("segmentation_keys") or {})
+    for key in ("frac_stain", "frac_boundary_stain", "frac_interior_stain",
+                "frac_nuc_expansion", "frac_imported_cells",
+                "segmentation_stain"):
+        if metrics.get(key) is not None:
+            seg_keys.setdefault(f"metrics_summary.{key}", metrics[key])
+    exp["segmentation_keys"] = seg_keys
+    probe.experiment = exp
+
+
 def probe_run(
     entry: RunEntry,
     findings: Findings | None = None,
@@ -394,14 +450,17 @@ def probe_run(
             )
     else:
         probe.ok = False
-        f.error(
-            "panel.features_missing",
-            f"No readable feature list in {entry.run_dir}. Looked for: "
-            + ", ".join(rel for rel, _ in FEATURE_SOURCES)
-            + ".",
-            evidence={"run_dir": str(entry.run_dir), "errors": source_errors},
-            run_ids=[entry.run_id],
-        )
+        # Reported at error severity only when nothing else describes the run;
+        # manifest.validate() has already explained the metrics-only case.
+        if find_metrics_summary(entry.run_dir) is None:
+            f.error(
+                "panel.features_missing",
+                f"No readable feature list in {entry.run_dir}. Looked for: "
+                + ", ".join(rel for rel, _ in FEATURE_SOURCES)
+                + ".",
+                evidence={"run_dir": str(entry.run_dir), "errors": source_errors},
+                run_ids=[entry.run_id],
+            )
 
     # -- experiment.xenium ----------------------------------------------
     exp_path = entry.experiment_path()
@@ -415,6 +474,26 @@ def probe_run(
                 evidence={"path": str(exp_path)},
                 run_ids=[entry.run_id],
             )
+
+    # -- metrics_summary.csv ---------------------------------------------
+    # Ranger's own QC sheet. It overlaps experiment.xenium and adds covariates
+    # that appear nowhere else (section thickness, transcript density, 10x's
+    # per-control rates). A run directory holding only this file still yields an
+    # inventory row, a segmentation call and a design verdict.
+    metrics_path = find_metrics_summary(entry.run_dir)
+    if metrics_path is not None:
+        probe.metrics = read_metrics_summary(metrics_path)
+        probe.metrics_source = metrics_path.name
+        if probe.metrics.get("parse_error"):
+            f.warning(
+                "run.metrics_unparseable",
+                f"{metrics_path.name} in {entry.run_dir} could not be parsed "
+                f"({probe.metrics['parse_error']}).",
+                evidence={"path": str(metrics_path)},
+                run_ids=[entry.run_id],
+            )
+        else:
+            _merge_metrics(probe, f, entry.run_id)
 
     # -- cells ----------------------------------------------------------
     if load_cells:

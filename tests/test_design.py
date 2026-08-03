@@ -21,6 +21,7 @@ from xenium_lea.design import (
     OVERALL_CAUTION,
     OVERALL_OK,
     PARTIAL,
+    PER_RUN,
     audit_design,
     classify_factor,
     cramers_v,
@@ -88,8 +89,20 @@ def test_factor_nested_within_condition():
     # across conditions, so there is no fixed level at which A and B can be
     # compared. Not CROSSED — more levels does not buy separability.
     assert classify_factor(
-        ["a1", "a2", "b1", "b2"], ["A", "A", "B", "B"]
+        ["a1", "a1", "a2", "b1", "b1", "b2"],
+        ["A", "A", "A", "B", "B", "B"],
     ) == NESTED
+
+
+def test_factor_with_one_level_per_run_is_not_a_batch_factor():
+    """
+    A factor that uniquely identifies each run labels the sample rather than
+    grouping samples. Treating it as confounded would mark every study where
+    each section was its own instrument run as unrecoverable.
+    """
+    assert classify_factor(
+        ["r1", "r2", "r3", "r4"], ["A", "A", "B", "B"]
+    ) == PER_RUN
 
 
 def test_factor_coarser_than_condition_is_aliased():
@@ -174,20 +187,18 @@ def test_nested_factor_gives_caution_not_blocked():
     adjusted for as a fixed effect, but with two dates per condition its
     variance is estimable — that is caution, not a dead end.
     """
+    # Six runs over four dates: two dates inside each condition, none shared
+    # across them. Fewer levels than runs, so this is real nesting rather than
+    # a per-run label.
+    dates = ["2024-01-05", "2024-01-05", "2024-01-06",
+             "2024-02-11", "2024-02-11", "2024-02-12"]
+    conds = ["AGED"] * 3 + ["ADULT"] * 3
     table = _table(
         [
-            {"run_id": "R1", "mouse_id": "M1", "section_id": "s1",
-             "condition": "AGED", "run_date": "2024-01-05",
-             "segmentation_kit": "stain_kit", "panel_group": "P1"},
-            {"run_id": "R2", "mouse_id": "M2", "section_id": "s1",
-             "condition": "AGED", "run_date": "2024-01-06",
-             "segmentation_kit": "stain_kit", "panel_group": "P1"},
-            {"run_id": "R3", "mouse_id": "M3", "section_id": "s1",
-             "condition": "ADULT", "run_date": "2024-02-11",
-             "segmentation_kit": "stain_kit", "panel_group": "P1"},
-            {"run_id": "R4", "mouse_id": "M4", "section_id": "s1",
-             "condition": "ADULT", "run_date": "2024-02-12",
-             "segmentation_kit": "stain_kit", "panel_group": "P1"},
+            {"run_id": f"R{i + 1}", "mouse_id": f"M{i + 1}", "section_id": "s1",
+             "condition": conds[i], "run_date": dates[i],
+             "segmentation_kit": "stain_kit", "panel_group": "P1"}
+            for i in range(6)
         ]
     )
     f = Findings()

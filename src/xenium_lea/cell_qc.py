@@ -88,6 +88,8 @@ CONTROL_RATE_WARN = 0.01
 _OUTLIER_METRICS = (
     "median_transcripts_per_cell",
     "control_rate",
+    "declared_neg_control_probe_rate",
+    "transcript_density",
     "median_cell_area",
     "frac_cells_below_10",
 )
@@ -149,12 +151,49 @@ def _run_metrics(
             "median_nucleus_area": None,
             "frac_cells_no_nucleus": None,
             "frac_cells_zero_transcripts": None,
+            "declared_neg_control_probe_rate": None,
+            "declared_neg_control_codeword_rate": None,
+            "transcript_density": None,
+            "section_thickness": None,
+            "frac_transcripts_assigned": None,
+            "total_cell_area": None,
+            "qc_source": None,
+            "metrics_source": None,
         }
     )
 
+    # Ranger's own QC sheet covers the same ground at run level. Used to fill
+    # gaps, and it is the only source when a run directory holds nothing else.
+    m = probe.metrics or {}
+    if m:
+        row["declared_neg_control_probe_rate"] = m.get(
+            "declared_neg_control_probe_rate"
+        )
+        row["declared_neg_control_codeword_rate"] = m.get(
+            "declared_neg_control_codeword_rate"
+        )
+        row["transcript_density"] = m.get("transcript_density")
+        row["section_thickness"] = m.get("section_thickness")
+        row["frac_transcripts_assigned"] = m.get("fraction_transcripts_assigned")
+        row["total_cell_area"] = m.get("total_cell_area")
+        row["metrics_source"] = probe.metrics_source
+
     cells = probe.cells
     if cells is None or cells.empty:
+        # No per-cell table: report what the metrics sheet states, clearly
+        # labelled, rather than leaving the run blank. These are Ranger's own
+        # numbers, not recomputed ones, so they are never mixed into a column
+        # holding cells-derived values.
+        if m:
+            row["n_cells"] = (
+                int(m["num_cells"]) if m.get("num_cells") is not None else 0
+            )
+            row["median_transcripts_per_cell"] = m.get("transcripts_per_cell")
+            row["frac_cells_zero_transcripts"] = m.get("frac_empty_cells")
+            row["qc_source"] = "metrics_summary.csv"
         return row
+
+    row["qc_source"] = "cells table"
 
     tx = _num(cells, "transcript_counts")
     if tx is not None:
@@ -283,7 +322,7 @@ def audit_cell_qc(
     if per_run.empty:
         return CellQC(per_run=per_run, thresholds=thresholds)
 
-    with_cells = per_run[per_run["n_cells"] > 0]
+    with_cells = per_run[per_run["n_cells"].fillna(0) > 0]
     if with_cells.empty:
         f.warning(
             "qc.no_cell_tables",

@@ -127,10 +127,37 @@ def audit_panels(
 
     usable = [p for p in probes if p.rna_genes]
     if not usable:
-        f.error(
-            "panel.no_usable_runs",
-            "No run yielded a readable gene list; the panel audit cannot run.",
-        )
+        # A study described only by metrics_summary.csv has no gene lists, and
+        # that is a known, stated limitation rather than a failure: panel
+        # *identity* still comes through as panel_design_id, and the whole
+        # design analysis runs on it. Only add-on gene membership is missing.
+        described = [p for p in probes if p.metrics]
+        if described:
+            f.warning(
+                "panel.no_gene_lists",
+                f"No run carries a gene list, so add-on panel membership and the "
+                f"safe gene set are unavailable. {len(described)}/{len(probes)} "
+                "run(s) do report a panel identity in metrics_summary.csv, and "
+                "the design analysis uses that — but two runs sharing a "
+                "panel_design_id is an assumption here rather than something "
+                "verified gene by gene. Add one full bundle per distinct "
+                "panel_design_id to check it.",
+                evidence={
+                    "design_ids": sorted(
+                        {
+                            str(p.metrics.get("panel_design_id"))
+                            for p in described
+                            if p.metrics.get("panel_design_id")
+                        }
+                    )
+                },
+            )
+        else:
+            f.error(
+                "panel.no_usable_runs",
+                "No run yielded a readable gene list or a metrics summary; the "
+                "panel audit cannot run.",
+            )
         return PanelAudit(
             base_genes=base_genes,
             per_run=pd.DataFrame(),

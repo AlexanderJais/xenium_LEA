@@ -103,6 +103,12 @@ class RunEntry:
         p = self.run_dir / _EXPERIMENT_FILE
         return p if p.exists() else None
 
+    def metrics_path(self) -> Path | None:
+        """Ranger's per-run QC sheet, if the bundle has one; see ``metrics.py``."""
+        from .metrics import find_metrics_summary
+
+        return find_metrics_summary(self.run_dir)
+
     def matrix_path(self) -> Path | None:
         """First present count-matrix container; see ``matrix.py``."""
         from .matrix import MATRIX_SOURCES
@@ -341,7 +347,14 @@ class RunManifest:
                 evidence={"mice": crossed},
             )
 
-        # Per-run directory checks.
+        # Per-run directory checks. Availability gaps are collected and
+        # reported once per category rather than once per run.
+        metrics_only: list[str] = []
+        missing_features: list[str] = []
+        missing_cells: list[str] = []
+        missing_experiment: list[str] = []
+        missing_matrix: list[str] = []
+
         for e in self._entries:
             if not e.run_dir.exists():
                 f.error(
@@ -360,45 +373,85 @@ class RunManifest:
                 )
                 continue
 
+            # File availability is accumulated and reported once per category
+            # below. Emitting it per run turns a partially-uploaded study into
+            # dozens of near-identical warnings that bury the real findings.
             if e.features_path() is None:
-                f.error(
-                    "run.features_missing",
-                    f"No feature list in {e.run_dir} — looked for "
-                    "cell_feature_matrix/features.tsv.gz, "
-                    "cell_feature_matrix.zarr.zip, cell_feature_matrix.h5 and "
-                    "gene_panel.json. The panel audit cannot run for this run.",
-                    evidence={"run_dir": str(e.run_dir)},
-                    run_ids=[e.run_id],
-                )
+                (missing_features if e.metrics_path() is None
+                 else metrics_only).append(e.run_id)
             if e.cells_path() is None:
-                f.warning(
-                    "run.cells_missing",
-                    f"No cells.parquet / cells.csv[.gz] in {e.run_dir}. "
-                    "Per-cell QC and the segmentation morphology fingerprint are "
-                    "unavailable for this run.",
-                    evidence={"run_dir": str(e.run_dir)},
-                    run_ids=[e.run_id],
-                )
+                missing_cells.append(e.run_id)
             if e.experiment_path() is None:
-                f.warning(
-                    "run.experiment_missing",
-                    f"No experiment.xenium in {e.run_dir}. Panel name, software "
-                    "version and declared segmentation settings are unavailable; "
-                    "the segmentation call falls back to structural and "
-                    "morphological evidence only.",
-                    evidence={"run_dir": str(e.run_dir)},
-                    run_ids=[e.run_id],
-                )
+                missing_experiment.append(e.run_id)
             if e.matrix_path() is None:
-                f.info(
-                    "run.matrix_missing",
-                    f"No count matrix in {e.run_dir} (matrix.mtx.gz, "
-                    "cell_feature_matrix.h5 or cell_feature_matrix.zarr.zip). "
-                    "Tier-0 audit is unaffected; the --deep pseudobulk pass will "
-                    "skip this run.",
-                    evidence={"run_dir": str(e.run_dir)},
-                    run_ids=[e.run_id],
-                )
+                missing_matrix.append(e.run_id)
+
+        n = len(self._entries)
+
+        def _listing(ids: list[str], limit: int = 8) -> str:
+            shown = ", ".join(sorted(ids)[:limit])
+            return shown + (f" ... (+{len(ids) - limit} more)" if len(ids) > limit else "")
+
+        if missing_features:
+            f.error(
+                "run.features_missing",
+                f"{len(missing_features)}/{n} run(s) have no feature list and no "
+                f"metrics_summary.csv, so nothing can be audited for them: "
+                f"{_listing(missing_features)}. Looked for "
+                "cell_feature_matrix/features.tsv.gz, cell_feature_matrix.zarr.zip, "
+                "cell_feature_matrix.h5, gene_panel.json and metrics_summary.csv.",
+                evidence={"runs": sorted(missing_features)},
+                run_ids=sorted(missing_features),
+            )
+
+        if metrics_only:
+            # The common state of a study mid-assembly, and a perfectly useful
+            # one: the verdict does not need the bundles.
+            f.warning(
+                "run.metrics_only",
+                f"{len(metrics_only)}/{n} run(s) are described by "
+                f"metrics_summary.csv alone: {_listing(metrics_only)}. That is "
+                "enough for the inventory, the segmentation call, run-level QC "
+                "and the full separability verdict. It is not enough for the "
+                "add-on gene lists, so the safe gene set and the --deep pass "
+                "cover only the runs with full bundles.",
+                evidence={"runs": sorted(metrics_only)},
+                run_ids=sorted(metrics_only),
+            )
+
+        if missing_cells:
+            f.warning(
+                "run.cells_missing",
+                f"{len(missing_cells)}/{n} run(s) have no cells table: "
+                f"{_listing(missing_cells)}. Per-cell QC and the morphology "
+                "fingerprint are unavailable for them; run-level QC from "
+                "metrics_summary.csv still is.",
+                evidence={"runs": sorted(missing_cells)},
+                run_ids=sorted(missing_cells),
+            )
+
+        if missing_experiment:
+            f.warning(
+                "run.experiment_missing",
+                f"{len(missing_experiment)}/{n} run(s) have no experiment.xenium: "
+                f"{_listing(missing_experiment)}. Instrument serial, software "
+                "versions and chemistry are unknown for them — so any factor "
+                "built on those fields separates the runs by *what was uploaded* "
+                "rather than by anything about the experiment. Such factors are "
+                "excluded from the verdict.",
+                evidence={"runs": sorted(missing_experiment)},
+                run_ids=sorted(missing_experiment),
+            )
+
+        if missing_matrix:
+            f.info(
+                "run.matrix_missing",
+                f"{len(missing_matrix)}/{n} run(s) have no count matrix: "
+                f"{_listing(missing_matrix)}. Tier-0 is unaffected; the --deep "
+                "pseudobulk pass skips them.",
+                evidence={"runs": sorted(missing_matrix)},
+                run_ids=sorted(missing_matrix),
+            )
 
         # Replicate structure.
         spm = self.sections_per_mouse()

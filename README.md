@@ -96,13 +96,22 @@ vary *within* each condition?":
 | Verdict | Meaning |
 |---|---|
 | `CONSTANT` | One level across the study. No effect is possible. |
+| `PER_RUN` | A distinct value for every run. Labels the sample rather than grouping samples, so it carries no batch information. Excluded from the verdict. |
+| `UNKNOWN_DOMINATED` | Unknown for most runs — the split tracks which files were uploaded, not the experiment. Excluded from the verdict. |
+| `GROUPING` | Groups the runs, but there is no condition column yet to test it against. |
 | `CROSSED` | Varies within every condition. Estimable, and adjustable without touching the condition contrast. |
 | `PARTIAL` | Varies within some conditions but not all. Estimable, unbalanced, reduced power. |
 | `NESTED` | Varies within a condition, but no level is shared across conditions. Not correctable as a fixed effect — including it absorbs the condition term — but its variance is estimable, so test condition against it as a random effect. |
 | `ALIASED` | Constant within each condition, different between them. **The factor and condition are the same contrast. Not estimable, not removable.** |
 
 Overall: `BLOCKED` if anything is `ALIASED`, `CAUTION` if anything is `PARTIAL`
-or `NESTED`, otherwise `OK`.
+or `NESTED`, `NO_CONTRAST` if fewer than two conditions are labelled, otherwise
+`OK`.
+
+Factors that move together are reported as one **equivalence class**, not as
+every pair: eleven factors changing at the same boundary is one fact about the
+study — usually one batch boundary wearing several names — and it means an
+effect cannot be attributed to any one of them.
 
 The audit also reports **within-mouse contrasts**: sections of the same animal
 that differ in a technical factor. Same biology, differing only technically —
@@ -143,8 +152,21 @@ metadata:
 |---|---|
 | Panel | `cell_feature_matrix/features.tsv.gz` → `cell_feature_matrix.zarr.zip` → `cell_feature_matrix.h5` → `gene_panel.json` |
 | Cells | `cells.parquet` → `cells.csv.gz` → `cells.csv` |
-| Metadata | `experiment.xenium` |
+| Metadata | `experiment.xenium` and `metrics_summary.csv` |
 | Counts (`--deep` only) | `cell_feature_matrix/matrix.mtx.gz` → `cell_feature_matrix.h5` → `cell_feature_matrix.zarr.zip` |
+
+**Start with `metrics_summary.csv` alone.** A run directory holding nothing but
+that one file — a few kB — still yields an inventory row, a segmentation call,
+run-level QC and the **full separability verdict**. It states the segmentation
+split outright (`segmented_cell_stain_frac`), names the custom add-on design
+(`panel_design_id`), and carries covariates that appear nowhere else: section
+thickness, transcript density per area, fraction of transcripts assigned. Only
+add-on *gene membership* needs the bundles, so you can get the verdict before
+copying anything large:
+
+```
+audit_root/runs/<region>/metrics_summary.csv
+```
 
 It never opens `transcripts.parquet`, boundary parquets, or morphology images —
 the bulk of a Xenium bundle. **Tier 0** (everything except question 7, including
