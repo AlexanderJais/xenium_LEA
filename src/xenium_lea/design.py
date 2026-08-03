@@ -97,6 +97,7 @@ OVERALL_NO_CONTRAST = "NO_CONTRAST"
 TECHNICAL_FACTORS = (
     "panel_group",
     "panel_design_id",
+    "slide_id",
     "segmentation_kit",
     "run_name",
     "analysis_sw_version",
@@ -326,6 +327,11 @@ def build_factor_table(
             # The instrument run is the batch in the ordinary sense: sections
             # processed together share reagents, operator and machine state.
             "run_name": _clean(exp.get("run_name")),
+            # The physical slide barcode. Distinct from cassette_name, which is
+            # only a position label within a run ("Slide1") and repeats across
+            # runs — keying a batch on it would silently merge unrelated slides.
+            "slide_id": _clean(exp.get("slide_id")),
+            "cassette_name": _clean(exp.get("cassette_name")),
             "analysis_sw_version": _clean(exp.get("analysis_sw_version")),
             "instrument_sw_version": _clean(exp.get("instrument_sw_version")),
             "instrument_sn": _clean(exp.get("instrument_sn")),
@@ -625,6 +631,8 @@ def audit_design(
     _report_alias_clusters(audit, f)
     _report_covariate_confounding(audit, f, covariates)
 
+    _report_slide_structure(audit, f)
+
     # -- within-mouse contrasts --------------------------------------------
     audit.within_mouse = _within_mouse_contrasts(factor_table, varying)
     if audit.within_mouse:
@@ -744,7 +752,22 @@ def _report_covariate_confounding(
     if not covariates:
         return
 
-    technical = set(TECHNICAL_FACTORS)
+    # A technical factor at animal resolution — one slide per mouse, say —
+    # trivially aliases with every per-animal covariate, because they are the
+    # same unit rather than two things that happened to coincide. Reporting that
+    # as a covariate confound restates "each mouse is one animal" as an error.
+    # The real finding, that slide and animal cannot be told apart, is reported
+    # by _report_slide_structure.
+    table = audit.factor_table
+    per_animal = set()
+    if "mouse_id" in table.columns:
+        mice = table["mouse_id"].astype(str)
+        per_animal = {
+            k for k in TECHNICAL_FACTORS
+            if k in table.columns and is_aliased(table[k].astype(str), mice)
+        }
+
+    technical = set(TECHNICAL_FACTORS) - per_animal
     for cov in covariates:
         partners = sorted(
             {
@@ -772,6 +795,53 @@ def _report_covariate_confounding(
                 "levels_by_condition": audit.verdicts[cov].levels_by_condition,
                 "crosstab": audit.verdicts[cov].crosstab,
             },
+        )
+
+
+def _report_slide_structure(audit: DesignAudit, f: Findings) -> None:
+    """
+    Say whether the slide and the animal are the same thing.
+
+    The slide is a real technical unit — reagent lot, hybridisation, position on
+    the instrument. It is only separable from between-animal variation if some
+    slide carries more than one mouse, or some mouse spans more than one slide.
+    One mouse per slide makes the two indistinguishable, so what looks like
+    animal-to-animal biological variation may be slide-to-slide technical
+    variation, and no analysis of this data can tell them apart.
+    """
+    table = audit.factor_table
+    if "slide_id" not in table.columns or "mouse_id" not in table.columns:
+        return
+    slides = table["slide_id"].astype(str)
+    mice = table["mouse_id"].astype(str)
+    if slides.nunique() <= 1 or (slides == UNKNOWN_LEVEL).any():
+        return
+
+    if is_aliased(slides, mice):
+        f.warning(
+            "design.slide_aliased_with_mouse",
+            f"Each of the {slides.nunique()} slides carries exactly one mouse, "
+            "so slide and animal are the same grouping. Slide-to-slide "
+            "technical variation — reagent lot, hybridisation, position on the "
+            "instrument — is therefore indistinguishable from animal-to-animal "
+            "biological variation. Nothing here can separate them; the "
+            "between-animal variance you estimate is really "
+            "between-animal-and-slide. Putting two mice on one slide in a future "
+            "run is what would break this.",
+            evidence={
+                "n_slides": int(slides.nunique()),
+                "n_mice": int(mice.nunique()),
+                "slide_to_mouse": dict(sorted(set(zip(slides, mice)))),
+            },
+        )
+    else:
+        f.info(
+            "design.slide_structure",
+            f"{slides.nunique()} slides across {mice.nunique()} mice, not in "
+            "one-to-one correspondence — so slide effects are at least "
+            "partially separable from animal effects.",
+            evidence={"n_slides": int(slides.nunique()),
+                      "n_mice": int(mice.nunique())},
         )
 
 

@@ -390,3 +390,89 @@ def test_a_factor_unknown_for_most_runs_is_still_excluded_entirely():
 
     assert audit.verdicts["instrument_sn"].verdict == UNKNOWN_DOMINATED
     assert f.has("design.factors_unknown_dominated")
+
+
+def test_slide_aliased_with_mouse_is_reported():
+    """
+    One mouse per slide makes slide-to-slide technical variation and
+    animal-to-animal biological variation the same thing.
+    """
+    table = pd.DataFrame(
+        [
+            {"run_id": f"R{i}", "mouse_id": f"M{i // 2}", "section_id": "s1",
+             "condition": "aged" if i < 4 else "adult",
+             "slide_id": f"001{4600 + i // 2}",
+             "segmentation_kit": "stain_kit"}
+            for i in range(8)
+        ]
+    )
+    f = Findings()
+    audit_design(table, findings=f)
+
+    assert f.has("design.slide_aliased_with_mouse")
+    ev = f.by_code("design.slide_aliased_with_mouse")[0].evidence
+    assert ev["n_slides"] == ev["n_mice"] == 4
+
+
+def test_two_mice_per_slide_makes_slide_effects_separable():
+    table = pd.DataFrame(
+        [
+            {"run_id": f"R{i}", "mouse_id": f"M{i}", "section_id": "s1",
+             "condition": "aged" if i < 4 else "adult",
+             "slide_id": f"001{4600 + i // 2}",
+             "segmentation_kit": "stain_kit"}
+            for i in range(8)
+        ]
+    )
+    f = Findings()
+    audit_design(table, findings=f)
+
+    assert not f.has("design.slide_aliased_with_mouse")
+    assert f.has("design.slide_structure")
+
+
+def test_a_per_animal_technical_factor_is_not_a_covariate_confound():
+    """
+    Regression: with one slide per mouse, every per-animal covariate aliases
+    with slide_id — because they are the same unit, not because a batch
+    boundary swallowed the covariate. Reporting that as an error restates
+    "each mouse is one animal" as a finding, and buries the real confounds.
+    """
+    table = pd.DataFrame(
+        [
+            {"run_id": f"R{i}", "mouse_id": f"M{i}", "section_id": "s1",
+             "condition": "aged" if i < 4 else "adult",
+             "slide_id": f"001{4600 + i}",          # one slide per mouse
+             "segmentation_kit": "stain_kit",
+             "age_weeks": [70, 68, 65, 73, 30, 29, 25, 24][i]}
+            for i in range(8)
+        ]
+    )
+    f = Findings()
+    audit_design(table, findings=f, covariates=["age_weeks"])
+
+    assert not f.has("design.covariate_aliased_with_technical")
+    assert not f.has_errors
+    # The genuine version of this fact is still reported.
+    assert f.has("design.slide_aliased_with_mouse")
+
+
+def test_a_covariate_tracking_a_real_batch_boundary_still_errors():
+    """The floor must not suppress the confound the check exists for."""
+    table = pd.DataFrame(
+        [
+            {"run_id": f"R{i}", "mouse_id": f"M{i}", "section_id": "s1",
+             "condition": "aged" if i % 2 else "adult",
+             "slide_id": f"001{4600 + i}",
+             "segmentation_kit": "stain_kit" if i < 4 else "nucleus_expansion",
+             "sex": "male" if i < 4 else "female"}
+            for i in range(8)
+        ]
+    )
+    f = Findings()
+    audit_design(table, findings=f, covariates=["sex"])
+
+    assert f.has("design.covariate_aliased_with_technical")
+    ev = f.by_code("design.covariate_aliased_with_technical")[0].evidence
+    assert ev["covariate"] == "sex"
+    assert "segmentation_kit" in ev["aliased_with"]
