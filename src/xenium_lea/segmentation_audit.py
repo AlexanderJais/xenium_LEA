@@ -15,11 +15,10 @@ collapsed into one number, because each fails differently:
    tracks the software generation, which is correlated with — not identical to —
    the kit.
 3. **Morphological** — the shape of the segmentation output itself. This one
-   cannot be faked by metadata: nucleus-expansion segmentation derives the cell
-   boundary from the nucleus by dilating it a fixed distance, so ``cell_area``
-   becomes a near-deterministic function of ``nucleus_area`` (high rank
-   correlation, tight nucleus/cell area ratio). Stain-based segmentation traces
-   a real membrane, so the two areas decouple.
+   cannot be faked by metadata: nucleus expansion grows each nucleus outward by
+   a fixed distance, so no cell's boundary can sit further from its nucleus than
+   that. A traced membrane obeys no such bound. The fingerprint reads that
+   **ceiling** — see :func:`_morphological_signal`.
 
 Where the three disagree, **the disagreement is the finding**. The kit call is
 reported with a confidence and with every number behind it, so a human can
@@ -30,6 +29,14 @@ signal in practice is *relative*: within one study, expansion-segmented and
 stain-segmented runs separate cleanly on these metrics even when no single
 absolute cutoff would be right. So a cross-run split is computed too, and a
 bimodal split is reported whatever the absolute calls say.
+
+A caution about the morphological signal, learned the hard way. Its first
+version tested whether nucleus and cell area were tightly *coupled*, reasoning
+that a dilated nucleus determines its cell. That is true of an idealised
+dilation and false of the real thing: expansion stops at neighbouring cells, so
+cell size tracks local density as much as nucleus size. A genuine 100%
+nucleus-expansion run scored as stain under that rule. Any future change here
+should be checked against real output of both kinds before it is believed.
 """
 
 from __future__ import annotations
@@ -51,16 +58,24 @@ KIT_STAIN = "stain_kit"              # multimodal cell segmentation staining
 KIT_EXPANSION = "nucleus_expansion"  # DAPI nucleus + fixed-distance dilation
 KIT_UNKNOWN = "unknown"
 
-#: Rank correlation between nucleus_area and cell_area above which the cell
-#: boundary looks derived from the nucleus rather than independently traced.
-EXPANSION_SPEARMAN_MIN = 0.90
+#: Ratio of the 99.9th to the 99th percentile of implied radial expansion,
+#: above which the distribution has no ceiling and the boundary was traced
+#: rather than dilated. See :func:`_morphological_signal` for why this is the
+#: statistic. Calibrated on real runs of each kind (1.06 for a 100%
+#: nucleus-expansion run, 1.47 for a 93%-stain one) and set conservatively
+#: between them, nearer the expansion side so a marginal case is left unknown
+#: rather than called wrongly.
+EXPANSION_TAIL_RATIO_MAX = 1.25
 
-#: Coefficient of variation of nucleus_area/cell_area below which the ratio
-#: looks fixed by construction rather than biological.
-EXPANSION_RATIO_CV_MAX = 0.20
+#: Implied expansion distances beyond this (um) are not plausible for a
+#: dilation-based segmentation at any setting 10x offers, so a ceiling estimated
+#: above it is not a ceiling.
+MAX_PLAUSIBLE_EXPANSION_UM = 20.0
 
 #: Minimum cells needed before the morphological fingerprint means anything.
-MIN_CELLS_FOR_MORPHOLOGY = 200
+#: The statistic reads the extreme tail, so it needs more cells than a
+#: median-based one would.
+MIN_CELLS_FOR_MORPHOLOGY = 2000
 
 #: Substrings that mark a cell as nucleus-expanded, matched case-insensitively
 #: against the per-cell ``segmentation_method`` string or the declared metadata.
@@ -227,16 +242,39 @@ def _morphological_signal(probe: RunProbe) -> tuple[str, dict[str, Any]]:
     """
     Fingerprint the segmentation from the geometry it produced.
 
-    Expansion segmentation dilates the nucleus by a fixed distance, so cell area
-    is a monotone function of nucleus area and the nucleus/cell ratio is nearly
-    constant. A traced membrane decouples the two.
+    Nucleus expansion grows each nucleus outward by a fixed distance, stopping
+    early where it meets a neighbour. So the *implied radial expansion* of every
+    cell,
+
+        d = sqrt(cell_area / pi) - sqrt(nucleus_area / pi)
+
+    has a **hard ceiling** at the configured distance: no cell can exceed it,
+    however isolated. A traced membrane obeys no such bound, and its d has a
+    long tail.
+
+    The statistic is therefore the tail ratio ``p99.9(d) / p99(d)``. A ceiling
+    makes the upper percentiles converge (ratio near 1); an unbounded
+    distribution keeps climbing. It is scale-free, so it needs no knowledge of
+    the expansion distance that was configured, and it is read from percentiles
+    rather than the maximum so one ragged polygon cannot flip the call.
+
+    An earlier version tested whether nucleus and cell area were *tightly
+    coupled*, on the reasoning that a dilated nucleus determines its cell. Real
+    data disproved that: because expansion stops at neighbours, cell size
+    depends on local density as much as on nucleus size, and a genuine 100%
+    nucleus-expansion run showed correlation 0.79 with a ratio CV of 0.45 —
+    scoring as stain under the old rule. The ceiling survives that clipping;
+    the coupling does not.
     """
     metrics: dict[str, Any] = {
         "n_cells_morphology": 0,
+        "implied_expansion_p99": np.nan,
+        "implied_expansion_p999": np.nan,
+        "implied_expansion_max": np.nan,
+        "expansion_tail_ratio": np.nan,
         "nucleus_cell_area_spearman": np.nan,
         "area_ratio_cv": np.nan,
         "area_ratio_median": np.nan,
-        "cell_area_cv": np.nan,
         "cell_area_median": np.nan,
         "nucleus_area_median": np.nan,
         "frac_cells_no_nucleus": np.nan,
@@ -248,7 +286,6 @@ def _morphological_signal(probe: RunProbe) -> tuple[str, dict[str, Any]]:
 
     cell_area = pd.to_numeric(cells["cell_area"], errors="coerce")
     metrics["cell_area_median"] = _round(cell_area.median())
-    metrics["cell_area_cv"] = _round(_cv(cell_area))
 
     if "nucleus_area" not in cells.columns:
         return KIT_UNKNOWN, metrics
@@ -264,38 +301,45 @@ def _morphological_signal(probe: RunProbe) -> tuple[str, dict[str, Any]]:
     # a non-zero fraction is itself informative.
     with np.errstate(invalid="ignore"):
         metrics["frac_cells_no_nucleus"] = _round(
-            float(((nucleus_area.fillna(0) <= 0)).mean())
+            float((nucleus_area.fillna(0) <= 0).mean())
         )
-
-    if n_valid < MIN_CELLS_FOR_MORPHOLOGY:
-        return KIT_UNKNOWN, metrics
 
     ca = cell_area[valid].to_numpy(dtype=float)
     na = nucleus_area[valid].to_numpy(dtype=float)
 
-    # Spearman needs variation in both; a constant column yields NaN.
-    if np.ptp(ca) > 0 and np.ptp(na) > 0:
-        rho = stats.spearmanr(na, ca).statistic
-        metrics["nucleus_cell_area_spearman"] = _round(float(rho))
-    else:
-        rho = np.nan
+    # Descriptive, and kept because they are what a human looks at first —
+    # they simply are not what the call is made on.
+    if len(ca) > 1 and np.ptp(ca) > 0 and np.ptp(na) > 0:
+        metrics["nucleus_cell_area_spearman"] = _round(
+            float(stats.spearmanr(na, ca).statistic)
+        )
+        ratio = na / ca
+        metrics["area_ratio_median"] = _round(float(np.median(ratio)))
+        metrics["area_ratio_cv"] = _round(_cv(pd.Series(ratio)))
 
-    ratio = na / ca
-    metrics["area_ratio_median"] = _round(float(np.median(ratio)))
-    metrics["area_ratio_cv"] = _round(_cv(pd.Series(ratio)))
-
-    rho_v = metrics["nucleus_cell_area_spearman"]
-    cv_v = metrics["area_ratio_cv"]
-    if rho_v is None or cv_v is None or np.isnan(rho_v) or np.isnan(cv_v):
+    if n_valid < MIN_CELLS_FOR_MORPHOLOGY:
         return KIT_UNKNOWN, metrics
 
-    looks_expanded = rho_v >= EXPANSION_SPEARMAN_MIN and cv_v <= EXPANSION_RATIO_CV_MAX
-    if looks_expanded:
-        return KIT_EXPANSION, metrics
-    # Clearly decoupled areas: a traced boundary.
-    if rho_v < EXPANSION_SPEARMAN_MIN and cv_v > EXPANSION_RATIO_CV_MAX:
-        return KIT_STAIN, metrics
-    return KIT_UNKNOWN, metrics
+    # Implied radial expansion, from circular-equivalent radii.
+    d = np.sqrt(ca / np.pi) - np.sqrt(na / np.pi)
+    d = d[np.isfinite(d)]
+    if len(d) < MIN_CELLS_FOR_MORPHOLOGY:
+        return KIT_UNKNOWN, metrics
+
+    p99, p999 = np.percentile(d, [99.0, 99.9])
+    metrics["implied_expansion_p99"] = _round(float(p99), 3)
+    metrics["implied_expansion_p999"] = _round(float(p999), 3)
+    metrics["implied_expansion_max"] = _round(float(d.max()), 3)
+
+    if p99 <= 0 or p99 > MAX_PLAUSIBLE_EXPANSION_UM:
+        return KIT_UNKNOWN, metrics
+
+    tail_ratio = float(p999 / p99)
+    metrics["expansion_tail_ratio"] = _round(tail_ratio, 4)
+
+    return (
+        KIT_EXPANSION if tail_ratio <= EXPANSION_TAIL_RATIO_MAX else KIT_STAIN
+    ), metrics
 
 
 def _cv(s: pd.Series) -> float:
@@ -488,7 +532,7 @@ def _report_stain_fraction_spread(table: pd.DataFrame, f: Findings) -> None:
 
 def _report_morphology_split(table: pd.DataFrame, f: Findings) -> None:
     """Flag a bimodal morphological fingerprint across runs."""
-    col = "nucleus_cell_area_spearman"
+    col = "expansion_tail_ratio"
     if col not in table.columns:
         return
     vals = pd.to_numeric(table[col], errors="coerce").dropna()
@@ -514,16 +558,17 @@ def _report_morphology_split(table: pd.DataFrame, f: Findings) -> None:
 
     f.warning(
         "segmentation.morphology_split",
-        f"Runs split into two groups on the nucleus/cell area coupling "
-        f"(gap of {max_gap:.2f} at rho={split_at:.2f}): "
-        f"loosely coupled = {', '.join(sorted(low))}; tightly coupled = "
-        f"{', '.join(sorted(high))}. Tight coupling indicates nucleus-expansion "
-        "segmentation. This split is derived from the geometry alone and holds "
+        f"Runs split into two groups on the implied-expansion tail ratio "
+        f"(gap of {max_gap:.2f} at {split_at:.2f}): bounded = "
+        f"{', '.join(sorted(low))}; unbounded = {', '.join(sorted(high))}. "
+        "A bounded tail means every cell's growth beyond its nucleus stopped at "
+        "the same ceiling, which is what nucleus expansion does and a traced "
+        "membrane does not. This split comes from the geometry alone and holds "
         "regardless of what the metadata declares.",
         evidence={
-            "split_at_spearman": round(split_at, 4),
+            "split_at_tail_ratio": round(split_at, 4),
             "max_gap": round(max_gap, 4),
-            "loosely_coupled": sorted(low.tolist()),
-            "tightly_coupled": sorted(high.tolist()),
+            "bounded_expansion_like": sorted(low.tolist()),
+            "unbounded_stain_like": sorted(high.tolist()),
         },
     )

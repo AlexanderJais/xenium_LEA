@@ -40,26 +40,48 @@ def _probe(tmp_path, run_id, **kwargs):
 # ---------------------------------------------------------------------------
 
 def test_expansion_run_is_called_expansion(tmp_path):
-    p = _probe(tmp_path, "R1", n_cells=800, segmentation=fx.EXPANSION, seed=1)
+    p = _probe(tmp_path, "R1", n_cells=4000, segmentation=fx.EXPANSION, seed=1)
     table, calls = audit_segmentation([p], Findings())
 
     call = calls["R1"]
     assert call.call == KIT_EXPANSION
     assert call.morphological == KIT_EXPANSION
-    # Nucleus-derived boundary: areas are near-deterministically coupled.
-    assert call.metrics["nucleus_cell_area_spearman"] > 0.95
-    assert call.metrics["area_ratio_cv"] < 0.2
+    # A dilated nucleus cannot exceed the configured distance, so the upper
+    # percentiles of implied expansion converge.
+    assert call.metrics["expansion_tail_ratio"] <= 1.25
+    assert call.metrics["implied_expansion_max"] < 6.0
 
 
 def test_stain_run_is_called_stain(tmp_path):
-    p = _probe(tmp_path, "R1", n_cells=800, segmentation=fx.STAIN, seed=2)
+    p = _probe(tmp_path, "R1", n_cells=4000, segmentation=fx.STAIN, seed=2)
     table, calls = audit_segmentation([p], Findings())
 
     call = calls["R1"]
     assert call.call == KIT_STAIN
     assert call.morphological == KIT_STAIN
-    # A traced membrane decouples nucleus and cell area.
-    assert call.metrics["nucleus_cell_area_spearman"] < 0.5
+    # A traced boundary has no ceiling, so the tail keeps climbing.
+    assert call.metrics["expansion_tail_ratio"] > 1.25
+
+
+def test_loosely_coupled_areas_do_not_imply_a_traced_boundary(tmp_path):
+    """
+    Regression against the rule this replaced.
+
+    Real nucleus expansion stops at neighbouring cells, so nucleus and cell
+    area are only loosely coupled — a genuine 100%-expansion run measured
+    Spearman 0.79 with a ratio CV of 0.45. The old fingerprint required tight
+    coupling and therefore called such a run stain-segmented. The call must now
+    rest on the ceiling, not the correlation.
+    """
+    p = _probe(tmp_path, "R1", n_cells=4000, segmentation=fx.EXPANSION, seed=3)
+    _, calls = audit_segmentation([p], Findings())
+    call = calls["R1"]
+
+    # Loose coupling, exactly as the real run shows...
+    assert call.metrics["nucleus_cell_area_spearman"] < 0.95
+    assert call.metrics["area_ratio_cv"] > 0.05
+    # ...and still correctly called expansion.
+    assert call.morphological == KIT_EXPANSION
 
 
 def test_morphology_alone_identifies_expansion_without_any_metadata(tmp_path):
@@ -68,7 +90,7 @@ def test_morphology_alone_identifies_expansion_without_any_metadata(tmp_path):
     segmentation_method column, and the call must still be right.
     """
     p = _probe(
-        tmp_path, "R1", n_cells=800, segmentation=fx.EXPANSION,
+        tmp_path, "R1", n_cells=4000, segmentation=fx.EXPANSION,
         include_experiment=False, seed=3,
     )
     _, calls = audit_segmentation([p], Findings())
@@ -79,8 +101,8 @@ def test_morphology_alone_identifies_expansion_without_any_metadata(tmp_path):
 
 
 def test_mixed_study_is_flagged(tmp_path):
-    a = _probe(tmp_path, "R1", n_cells=800, segmentation=fx.EXPANSION, seed=4)
-    b = _probe(tmp_path, "R2", n_cells=800, segmentation=fx.STAIN, seed=5)
+    a = _probe(tmp_path, "R1", n_cells=4000, segmentation=fx.EXPANSION, seed=4)
+    b = _probe(tmp_path, "R2", n_cells=4000, segmentation=fx.STAIN, seed=5)
 
     f = Findings()
     table, calls = audit_segmentation([a, b], f)
@@ -90,8 +112,8 @@ def test_mixed_study_is_flagged(tmp_path):
 
 
 def test_uniform_study_is_not_flagged_as_mixed(tmp_path):
-    a = _probe(tmp_path, "R1", n_cells=800, segmentation=fx.STAIN, seed=6)
-    b = _probe(tmp_path, "R2", n_cells=800, segmentation=fx.STAIN, seed=7)
+    a = _probe(tmp_path, "R1", n_cells=4000, segmentation=fx.STAIN, seed=6)
+    b = _probe(tmp_path, "R2", n_cells=4000, segmentation=fx.STAIN, seed=7)
 
     f = Findings()
     audit_segmentation([a, b], f)
@@ -102,10 +124,10 @@ def test_uniform_study_is_not_flagged_as_mixed(tmp_path):
 
 def test_morphology_split_is_reported_across_runs(tmp_path):
     probes = [
-        _probe(tmp_path, f"E{i}", n_cells=600, segmentation=fx.EXPANSION, seed=10 + i)
+        _probe(tmp_path, f"E{i}", n_cells=4000, segmentation=fx.EXPANSION, seed=10 + i)
         for i in range(2)
     ] + [
-        _probe(tmp_path, f"S{i}", n_cells=600, segmentation=fx.STAIN, seed=20 + i)
+        _probe(tmp_path, f"S{i}", n_cells=4000, segmentation=fx.STAIN, seed=20 + i)
         for i in range(2)
     ]
 
@@ -114,14 +136,14 @@ def test_morphology_split_is_reported_across_runs(tmp_path):
 
     assert f.has("segmentation.morphology_split")
     split = f.by_code("segmentation.morphology_split")[0]
-    assert set(split.evidence["tightly_coupled"]) == {"E0", "E1"}
-    assert set(split.evidence["loosely_coupled"]) == {"S0", "S1"}
+    assert set(split.evidence["bounded_expansion_like"]) == {"E0", "E1"}
+    assert set(split.evidence["unbounded_stain_like"]) == {"S0", "S1"}
 
 
 def test_declared_metadata_conflicting_with_geometry_is_flagged(tmp_path):
     """A run whose JSON claims the kit but whose geometry says expansion."""
     run = tmp_path / "R1"
-    fx.make_run(run, genes=fx.base_gene_names(15), n_cells=800,
+    fx.make_run(run, genes=fx.base_gene_names(15), n_cells=4000,
                 segmentation=fx.EXPANSION, seed=8)
     # Replace the metadata with a stain-kit declaration and no quantitative
     # fractions — the pre-v4 situation, where all the metadata offers is a word.
@@ -156,7 +178,7 @@ def test_interior_stain_majority_is_called_stain(tmp_path):
     called the whole run nucleus-expanded — inverting the kit assignment for
     every real run.
     """
-    p = _probe(tmp_path, "R1", n_cells=2000, segmentation=fx.STAIN, seed=31)
+    p = _probe(tmp_path, "R1", n_cells=4000, segmentation=fx.STAIN, seed=31)
 
     methods = p.cells["segmentation_method"].value_counts()
     assert methods.idxmax().startswith("Segmented by interior stain")
@@ -173,7 +195,7 @@ def test_interior_stain_majority_is_called_stain(tmp_path):
 
 def test_declared_fractions_drive_the_call_when_present(tmp_path):
     """v4+ states the split outright; nothing needs inferring."""
-    p = _probe(tmp_path, "R1", n_cells=800, segmentation=fx.STAIN,
+    p = _probe(tmp_path, "R1", n_cells=4000, segmentation=fx.STAIN,
                stain_frac=0.93, seed=32)
     _, calls = audit_segmentation([p], Findings())
 
@@ -191,9 +213,9 @@ def test_stain_fraction_spread_across_kit_runs_is_flagged(tmp_path):
     section by stain — a graded technical difference in the same direction a
     kit-vs-no-kit difference would push.
     """
-    a = _probe(tmp_path, "R1", n_cells=800, segmentation=fx.STAIN,
+    a = _probe(tmp_path, "R1", n_cells=4000, segmentation=fx.STAIN,
                stain_frac=0.95, seed=33)
-    b = _probe(tmp_path, "R2", n_cells=800, segmentation=fx.STAIN,
+    b = _probe(tmp_path, "R2", n_cells=4000, segmentation=fx.STAIN,
                stain_frac=0.60, seed=34)
 
     f = Findings()
@@ -204,7 +226,7 @@ def test_stain_fraction_spread_across_kit_runs_is_flagged(tmp_path):
 
 
 def test_too_few_cells_yields_no_morphological_call(tmp_path):
-    p = _probe(tmp_path, "R1", n_cells=50, segmentation=fx.EXPANSION, seed=9)
+    p = _probe(tmp_path, "R1", n_cells=500, segmentation=fx.EXPANSION, seed=9)
     _, calls = audit_segmentation([p], Findings())
     assert calls["R1"].morphological == KIT_UNKNOWN
 

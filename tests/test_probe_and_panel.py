@@ -266,3 +266,71 @@ def test_retention_table_spans_every_threshold(study):
     assert ret.loc[4, "addon_genes_kept"] == 1      # only AddShared is everywhere
     # A stricter rule can never keep more genes.
     assert ret["addon_genes_kept"].is_monotonic_decreasing
+
+
+def test_base_and_addon_panel_identities_are_judged_separately(tmp_path):
+    """
+    A Xenium add-on panel has two identities that mean different things.
+    predesigned_panel_id names the catalogue base, which must match everywhere;
+    panel_design_id names the custom add-on, which legitimately differs.
+    """
+    base = fx.base_gene_names(20)
+    panel_csv = fx.write_base_panel_csv(tmp_path / "panel.csv", base)
+
+    for rid, design, addons in [
+        ("R1", "7ZBFXR", ["Shared1", "OnlyA"]),
+        ("R2", "NCY734", ["Shared1", "OnlyB"]),
+    ]:
+        d = tmp_path / rid
+        fx.make_run(d, genes=base + addons, n_cells=200, seed=len(rid))
+        meta = json.loads((d / "experiment.xenium").read_text())
+        meta["panel_design_id"] = design
+        meta["panel_predesigned_id"] = "mBrain_v1.1"   # same base for both
+        (d / "experiment.xenium").write_text(json.dumps(meta))
+
+    manifest = (
+        RunManifest()
+        .add("R1", "M1", "aged", tmp_path / "R1")
+        .add("R2", "M2", "adult", tmp_path / "R2")
+    )
+    f = Findings()
+    probes = [probe_run(e, f) for e in manifest]
+    audit = audit_panels(probes, load_base_panel(panel_csv), findings=f)
+
+    # A shared base is reported as fine, not as a conflict...
+    assert f.has("panel.shared_base_design")
+    assert not f.has("panel.multiple_base_panels")
+    # ...while differing add-on designs are a warning.
+    assert f.has("panel.multiple_addon_designs")
+    assert not f.has_errors
+
+    # And the gene-level truth backs it up.
+    assert set(audit.safe_genes) == set(base) | {"Shared1"}
+    cats = audit.gene_categories().set_index("gene")
+    assert cats.loc["Shared1", "category"] == "shared_all"
+    assert cats.loc["OnlyA", "category"] == "unique"
+
+
+def test_differing_base_panels_are_an_error(tmp_path):
+    """Different catalogue bases means even shared symbols may differ in probes."""
+    base = fx.base_gene_names(15)
+    panel_csv = fx.write_base_panel_csv(tmp_path / "panel.csv", base)
+
+    for rid, predesigned in [("R1", "mBrain_v1.1"), ("R2", "mBrain_v2.0")]:
+        d = tmp_path / rid
+        fx.make_run(d, genes=base, n_cells=150, seed=len(rid))
+        meta = json.loads((d / "experiment.xenium").read_text())
+        meta["panel_predesigned_id"] = predesigned
+        (d / "experiment.xenium").write_text(json.dumps(meta))
+
+    manifest = (
+        RunManifest()
+        .add("R1", "M1", "aged", tmp_path / "R1")
+        .add("R2", "M2", "adult", tmp_path / "R2")
+    )
+    f = Findings()
+    probes = [probe_run(e, f) for e in manifest]
+    audit_panels(probes, load_base_panel(panel_csv), findings=f)
+
+    assert f.has("panel.multiple_base_panels")
+    assert f.has_errors

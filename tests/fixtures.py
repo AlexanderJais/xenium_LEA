@@ -9,12 +9,22 @@ column names, and an experiment.xenium whose key layout matches what Xenium
 Ranger writes.
 
 The two segmentation generations are modelled explicitly, because the
-morphological fingerprint in ``segmentation_audit`` is what distinguishes them:
+morphological fingerprint in ``segmentation_audit`` is what distinguishes them —
+and the modelling has to match how real runs actually behave, not how they might
+be imagined to:
 
-``KIT_EXPANSION``  cell_area is derived from nucleus_area by dilating a fixed
-                   distance, so the two are near-deterministically coupled.
-``KIT_STAIN``      cell_area comes from a traced membrane, independent of the
-                   nucleus, so the areas decouple.
+``KIT_EXPANSION``  the nucleus is dilated a fixed distance but stops early at
+                   neighbours, so nucleus and cell area end up only *loosely*
+                   coupled. What survives the clipping is a hard ceiling: no
+                   cell's boundary sits further from its nucleus than the
+                   configured distance.
+``KIT_STAIN``      a traced membrane, independent of the nucleus and with a
+                   heavy right tail, because nothing caps how far a boundary may
+                   sit from its nucleus.
+
+The ceiling is the discriminator. An earlier fixture modelled expansion as a
+deterministic function of nucleus area, which made the two trivially separable
+on correlation — and hid that real expansion is not deterministic at all.
 """
 
 from __future__ import annotations
@@ -175,16 +185,23 @@ def make_run(
 
     nucleus_area = rng.gamma(shape=6.0, scale=6.0, size=n_cells) + 8.0
     if segmentation == EXPANSION:
-        # Cell boundary = nucleus dilated by a fixed distance. Treating the
-        # nucleus as roughly circular, area maps through radius + d.
-        d = 5.0
+        # Nucleus dilated by a fixed distance, but stopping early wherever it
+        # meets a neighbour. Real runs are dominated by that clipping: it makes
+        # cell size depend on local density as much as on nucleus size, so
+        # nucleus and cell area end up only loosely coupled. What survives is
+        # the *ceiling* -- no cell exceeds the configured distance -- and that
+        # is what the fingerprint reads.
+        d_max = 5.0
+        achieved = d_max * rng.beta(5.0, 2.0, size=n_cells)  # clipped, capped
         radius = np.sqrt(nucleus_area / np.pi)
-        cell_area = np.pi * (radius + d) ** 2
-        cell_area *= rng.normal(1.0, 0.01, size=n_cells)  # tiny measurement noise
+        cell_area = np.pi * (radius + achieved) ** 2
         seg_method = np.array(["Segmented by nucleus expansion of 5.0\u00b5m"] * n_cells)
     else:
-        # Traced membrane: area independent of the nucleus.
-        cell_area = rng.gamma(shape=4.0, scale=45.0, size=n_cells) + 40.0
+        # Traced membrane: area independent of the nucleus, and crucially with a
+        # heavy right tail. Nothing caps how far a boundary may sit from its
+        # nucleus, so a few cells run far out -- that unbounded tail is exactly
+        # what distinguishes a stain run from a dilated one.
+        cell_area = np.exp(rng.normal(np.log(70.0), 0.85, size=n_cells)) + 20.0
         # Real kit runs resolve most cells by *interior* stain, a minority by
         # boundary stain, and fall back to nucleus expansion for the rest.
         seg_method = np.array(

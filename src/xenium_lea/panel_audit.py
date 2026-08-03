@@ -224,19 +224,46 @@ def audit_panels(
             evidence={"n_base_genes": len(base_genes), "n_runs": n},
         )
 
-    # Distinct panel identities declared in experiment.xenium.
-    declared = {
-        str(p.experiment.get("panel_design_id") or p.experiment.get("panel_name"))
+    # A Xenium add-on panel has two identities, and they mean different things.
+    # panel_predesigned_id names the catalogue base panel and must be shared for
+    # the base genes to be comparable at all. panel_design_id names the custom
+    # add-on built on top of it, and legitimately differs between orders.
+    predesigned = {
+        str(p.experiment.get("panel_predesigned_id"))
         for p in usable
-        if p.experiment.get("panel_design_id") or p.experiment.get("panel_name")
+        if p.experiment.get("panel_predesigned_id")
     }
-    if len(declared) > 1:
+    design_ids = {
+        str(p.experiment.get("panel_design_id"))
+        for p in usable
+        if p.experiment.get("panel_design_id")
+    }
+
+    if len(predesigned) > 1:
+        f.error(
+            "panel.multiple_base_panels",
+            f"Runs were built on {len(predesigned)} different predesigned base "
+            f"panels: {sorted(predesigned)}. The base panel is the part meant to "
+            "be identical everywhere, so even the shared genes may not be "
+            "measured by the same probes.",
+            evidence={"predesigned_panel_ids": sorted(predesigned)},
+        )
+    elif predesigned:
+        f.info(
+            "panel.shared_base_design",
+            f"All runs are built on the same predesigned base panel "
+            f"({predesigned.pop()}), so the base genes are directly comparable.",
+        )
+
+    if len(design_ids) > 1:
         f.warning(
-            "panel.multiple_declared_panels",
-            f"Runs declare {len(declared)} different panel identities in "
-            f"experiment.xenium: {sorted(declared)}. Expected one shared base "
-            "panel design across the study.",
-            evidence={"declared": sorted(declared)},
+            "panel.multiple_addon_designs",
+            f"Runs carry {len(design_ids)} different custom add-on designs: "
+            f"{sorted(design_ids)}. Different design IDs generally mean "
+            "different add-on gene lists — see the add-on overlap below for "
+            "what they actually share. Whether this threatens the analysis "
+            "depends on how the designs line up with condition.",
+            evidence={"panel_design_ids": sorted(design_ids)},
         )
 
     # -- add-on overlap matrix -----------------------------------------
