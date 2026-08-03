@@ -238,6 +238,7 @@ class DesignAudit:
     factor_pairs: list[dict[str, Any]] = field(default_factory=list)
     within_mouse: list[dict[str, Any]] = field(default_factory=list)
     alias_clusters: list[list[str]] = field(default_factory=list)
+    covariates: list[str] = field(default_factory=list)
     replicates: dict[str, dict[str, int]] = field(default_factory=dict)
     overall: str = OVERALL_OK
     condition_levels: list[str] = field(default_factory=list)
@@ -270,6 +271,7 @@ class DesignAudit:
             "factors": {k: v.to_dict() for k, v in self.verdicts.items()},
             "factor_pairs": self.factor_pairs,
             "alias_clusters": self.alias_clusters,
+            "covariates": self.covariates,
             "within_mouse_contrasts": self.within_mouse,
             "n_runs": int(len(self.factor_table)),
             "n_mice": (
@@ -416,9 +418,20 @@ def audit_design(
     factor_table: pd.DataFrame,
     findings: Findings | None = None,
     factors: Iterable[str] = TECHNICAL_FACTORS,
+    covariates: Iterable[str] = (),
 ) -> DesignAudit:
-    """Produce the separability verdict."""
+    """
+    Produce the separability verdict.
+
+    ``covariates`` are extra columns supplied in the manifest — sex, age, batch
+    of surgery, anything the experimenter tracked. They are analysed alongside
+    the technical factors but carry a distinct risk: a *biological* covariate
+    that is indistinguishable from a technical factor means that biological
+    question cannot be asked of this dataset at all, whatever happens to the
+    primary contrast.
+    """
     f = findings if findings is not None else Findings()
+    covariates = [c for c in covariates if c in factor_table.columns]
 
     if factor_table.empty:
         f.error("design.no_runs", "No runs available for the design analysis.")
@@ -436,10 +449,11 @@ def audit_design(
     # -- factor vs condition ---------------------------------------------
     unknown_dominated: dict[str, int] = {}
     considered = [
-        c for c in factors
+        c for c in list(factors) + list(covariates)
         if c in factor_table.columns
         and factor_table[c].astype(str).nunique() > 0
     ]
+    audit.covariates = list(covariates)
 
     for col in considered:
         values = factor_table[col].astype(str)
@@ -479,7 +493,15 @@ def audit_design(
             message=message,
         )
 
-        if verdict == ALIASED:
+        if col in covariates and verdict in (NESTED, CROSSED, PARTIAL):
+            # Covariate structure is reported through the covariate findings.
+            f.info(
+                "design.covariate_structure",
+                f"Covariate '{col}' vs condition: {verdict}. " + message,
+                evidence={"covariate": col, "verdict": verdict,
+                          "levels_by_condition": by_cond},
+            )
+        elif verdict == ALIASED:
             f.error(
                 "design.factor_aliased",
                 message,
@@ -572,6 +594,7 @@ def audit_design(
     # pair: eleven factors moving together is one fact about the study, not
     # fifty-five separate warnings.
     _report_alias_clusters(audit, f)
+    _report_covariate_confounding(audit, f, covariates)
 
     # -- within-mouse contrasts --------------------------------------------
     audit.within_mouse = _within_mouse_contrasts(factor_table, varying)
@@ -600,7 +623,14 @@ def audit_design(
     # with each other is reported above but does not enter here — it means an
     # effect cannot be attributed to one of them rather than the other, which
     # never threatens the condition comparison.
-    verdict_values = {v.verdict for v in audit.verdicts.values()}
+    # The overall verdict answers one question: are the *technical* effects
+    # separable from the biology? A supplied covariate nested within condition
+    # is biology — age in weeks nested within aged/adult is the definition of
+    # the groups, not a confound — so covariates are reported on their own terms
+    # (including the aliased-with-technical error above) and kept out of here.
+    verdict_values = {
+        v.verdict for k, v in audit.verdicts.items() if k not in set(covariates)
+    }
     if len(cond_levels) < 2:
         audit.overall = OVERALL_NO_CONTRAST
     elif ALIASED in verdict_values:
@@ -665,6 +695,54 @@ def _report_alias_clusters(audit: DesignAudit, f: Findings) -> None:
             "In practice this is one batch boundary wearing several names; treat "
             "it as a single factor and be explicit about that in any writeup.",
             evidence={"factors": group, "levels": levels},
+        )
+
+
+def _report_covariate_confounding(
+    audit: DesignAudit, f: Findings, covariates: Iterable[str]
+) -> None:
+    """
+    Flag a supplied covariate that is indistinguishable from a technical factor.
+
+    This is a different failure from a confounded primary contrast, and easy to
+    miss because the primary contrast can be perfectly clean while it holds. If
+    every male was processed in one batch and every female in another, then a
+    sex difference and a batch difference are the same contrast: that question
+    is unanswerable from this dataset no matter how well the main comparison
+    behaves.
+    """
+    covariates = [c for c in covariates if c in audit.verdicts]
+    if not covariates:
+        return
+
+    technical = set(TECHNICAL_FACTORS)
+    for cov in covariates:
+        partners = sorted(
+            {
+                p["factor_b"] if p["factor_a"] == cov else p["factor_a"]
+                for p in audit.factor_pairs
+                if p["aliased"] and cov in (p["factor_a"], p["factor_b"])
+            }
+            & technical
+        )
+        if not partners:
+            continue
+        f.error(
+            "design.covariate_aliased_with_technical",
+            f"The covariate '{cov}' is perfectly aliased with technical "
+            f"factor(s): {', '.join(partners)}. Every level of '{cov}' was "
+            "processed under a different technical condition, so a "
+            f"'{cov}' effect and a technical effect are the same contrast. Any "
+            f"analysis of '{cov}' in this dataset — including stratifying or "
+            "adjusting by it — would report the batch difference under that "
+            "name. This is separate from the primary contrast, which may be "
+            "perfectly sound.",
+            evidence={
+                "covariate": cov,
+                "aliased_with": partners,
+                "levels_by_condition": audit.verdicts[cov].levels_by_condition,
+                "crosstab": audit.verdicts[cov].crosstab,
+            },
         )
 
 

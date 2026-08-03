@@ -71,7 +71,14 @@ def run_audit(
         segmentation=segmentation,
         manifest=manifest,
     )
-    design = audit_design(factor_table, findings=findings)
+    # Any manifest column beyond the required ones is a covariate the
+    # experimenter tracked — sex, age, surgery batch. Analysed alongside the
+    # technical factors, because one of those being indistinguishable from a
+    # technical factor silently removes a biological question.
+    covariates = sorted({k for e in manifest for k in e.overrides})
+    design = audit_design(
+        factor_table, findings=findings, covariates=covariates
+    )
 
     result = AuditResult(
         findings=findings,

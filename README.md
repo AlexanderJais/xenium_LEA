@@ -52,11 +52,14 @@ where your analysis environment does not.
 Write a manifest (copy `manifest_template.csv`):
 
 ```csv
-run_id,mouse_id,section_id,condition,run_dir
-AGED_1_s1,M_A01,s1,AGED,/data/xenium/aged_mouse1_sectionA
-AGED_1_s2,M_A01,s2,AGED,/data/xenium/aged_mouse1_sectionB
-ADULT_1_s1,M_D01,s1,ADULT,/data/xenium/adult_mouse1_sectionA
+run_id,mouse_id,section_id,condition,run_dir,sex,age_weeks
+AGED_1_s1,M_A01,s1,aged,/data/xenium/aged_mouse1_sectionA,male,70
+AGED_1_s2,M_A01,s2,aged,/data/xenium/aged_mouse1_sectionB,male,70
+ADULT_1_s1,M_D01,s1,adult,/data/xenium/adult_mouse1_sectionA,female,25
 ```
+
+Columns beyond the five required ones are treated as covariates and analysed —
+add whatever you tracked.
 
 Then:
 
@@ -112,6 +115,16 @@ Factors that move together are reported as one **equivalence class**, not as
 every pair: eleven factors changing at the same boundary is one fact about the
 study — usually one batch boundary wearing several names — and it means an
 effect cannot be attributed to any one of them.
+
+**Extra manifest columns are treated as covariates** — sex, age, surgery batch,
+anything you tracked. They are checked against the technical factors as well as
+against condition, because a covariate that is *indistinguishable from a
+technical factor* removes a biological question even when the primary contrast
+is perfectly clean. If every male was processed in one batch and every female in
+another, a sex effect and a batch effect are the same contrast; the audit reports
+that as an error while still passing the main comparison. A covariate merely
+nested within condition — age in weeks inside aged/adult — is the definition of
+the groups rather than a confound, and does not affect the technical verdict.
 
 The audit also reports **within-mouse contrasts**: sections of the same animal
 that differ in a technical factor. Same biology, differing only technically —

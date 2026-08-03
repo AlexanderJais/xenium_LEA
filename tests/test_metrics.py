@@ -219,3 +219,64 @@ def test_run_date_is_recovered_from_the_run_name(tmp_path):
 
     dates = set(result.design.factor_table["run_date"])
     assert dates == {"2025-06-26", "2025-11-06"}
+
+
+def test_covariate_aliased_with_a_technical_factor_is_an_error(tmp_path):
+    """
+    The failure that hides behind a clean primary contrast.
+
+    Condition is perfectly balanced across the two processing batches, so the
+    main comparison is sound — but every male was processed in one batch and
+    every female in the other, so a sex effect and a batch effect are the same
+    contrast and that question is simply unanswerable here.
+    """
+    manifest_path, panel_csv = fx.build_metrics_study(
+        tmp_path,
+        [
+            ("A1", "MA1", "aged", "run_jun", "7ZBFXR", 0.0),
+            ("A2", "MA2", "adult", "run_jun", "7ZBFXR", 0.0),
+            ("B1", "MB1", "aged", "run_nov", "NCY734", 0.93),
+            ("B2", "MB2", "adult", "run_nov", "NCY734", 0.93),
+        ],
+    )
+    # Sex tracks the batch exactly; condition does not.
+    m = pd.read_csv(manifest_path)
+    m["sex"] = ["male", "male", "female", "female"]
+    m.to_csv(manifest_path, index=False)
+
+    result = run_audit(RunManifest.from_csv(manifest_path), panel_csv)
+
+    # The primary contrast is clean...
+    assert result.design.overall == "OK"
+    assert result.design.verdicts["segmentation_kit"].verdict == "CROSSED"
+    # ...and the covariate is still reported as unanswerable.
+    assert result.findings.has("design.covariate_aliased_with_technical")
+    assert result.findings.has_errors
+    finding = result.findings.by_code("design.covariate_aliased_with_technical")[0]
+    assert finding.evidence["covariate"] == "sex"
+    assert "segmentation_kit" in finding.evidence["aliased_with"]
+
+
+def test_covariate_nested_in_condition_does_not_downgrade_the_verdict(tmp_path):
+    """
+    Age in weeks determines aged/adult — it is the definition of the groups,
+    not a confound. The technical verdict must be unmoved by it.
+    """
+    manifest_path, panel_csv = fx.build_metrics_study(
+        tmp_path,
+        [
+            ("A1", "MA1", "aged", "run_jun", "7ZBFXR", 0.0),
+            ("A2", "MA2", "adult", "run_jun", "7ZBFXR", 0.0),
+            ("B1", "MB1", "aged", "run_nov", "NCY734", 0.93),
+            ("B2", "MB2", "adult", "run_nov", "NCY734", 0.93),
+        ],
+    )
+    m = pd.read_csv(manifest_path)
+    m["age_weeks"] = [70, 29, 68, 25]
+    m.to_csv(manifest_path, index=False)
+
+    result = run_audit(RunManifest.from_csv(manifest_path), panel_csv)
+
+    assert result.design.verdicts["age_weeks"].verdict in ("NESTED", "PER_RUN")
+    assert result.design.overall == "OK"
+    assert not result.findings.has("design.verdict_caution")
